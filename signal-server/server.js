@@ -2,58 +2,276 @@ const express = require('express');
 const { ExpressPeerServer } = require('peer');
 
 const app = express();
-const PORT = process.env.PORT || 9000;
 
-// Security: Only allow requests from our own deployed app origin
-// Set ALLOWED_ORIGIN env variable on Render to your deployed URL
+const PORT = Number(process.env.PORT) || 9000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-// CORS headers
+const PAIR_TTL_MS = 10 * 60 * 1000;
+const MAX_PEERS_PER_PAIR = 2;
+
+/*
+ * In-memory pairing registry.
+ *
+ * pairCode -> Map(peerId, lastSeenTimestamp)
+ *
+ * This is intentionally small because the app is designed for
+ * one private pair at a time. For multi-instance production
+ * deployments, replace this with Redis or another shared store.
+ */
+const pairings = new Map();
+
+app.use(express.json({ limit: '32kb' }));
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
+  const origin = req.headers.origin;
+
+  if (ALLOWED_ORIGIN === '*' || !origin) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin === ALLOWED_ORIGIN) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
   }
+
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type'
+  );
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
   next();
 });
 
-// Health check endpoint (needed for Render.com keep-alive)
+function normalizePairCode(value) {
+  if (typeof value !== 'string') return null;
+
+  const code = value.trim();
+
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(code)) {
+    return null;
+  }
+
+  return code;
+}
+
+function normalizePeerId(value) {
+  if (typeof value !== 'string') return null;
+
+  const peerId = value.trim();
+
+  // PeerJS IDs must start/end alphanumeric.
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,96}[A-Za-z0-9])?$/.test(peerId)) {
+    return null;
+  }
+
+  return peerId;
+}
+
+function cleanupExpiredPairings() {
+  const now = Date.now();
+
+  for (const [pairCode, peers] of pairings.entries()) {
+    for (const [peerId, lastSeen] of peers.entries()) {
+      if (now - lastSeen > PAIR_TTL_MS) {
+        peers.delete(peerId);
+      }
+    }
+
+    if (peers.size === 0) {
+      pairings.delete(pairCode);
+    }
+  }
+}
+
+function removePeerFromAllPairings(peerId) {
+  for (const [pairCode, peers] of pairings.entries()) {
+    peers.delete(peerId);
+
+    if (peers.size === 0) {
+      pairings.delete(pairCode);
+    }
+  }
+}
+
+setInterval(cleanupExpiredPairings, 30_000);
+
+/*
+ * Health check
+ */
 app.get('/', (req, res) => {
-  res.json({ status: 'VaultComms Signal Server Online', ts: new Date().toISOString() });
+  res.json({
+    status: 'VaultComms Signal Server Online',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Start HTTP server
+/*
+ * Join/refresh a pairing room.
+ *
+ * POST /pair/join
+ *
+ * Body:
+ * {
+ *   "pairCode": "PAIR-1314",
+ *   "peerId": "vault-..."
+ * }
+ */
+app.post('/pair/join', (req, res) => {
+  const pairCode = normalizePairCode(req.body?.pairCode);
+  const peerId = normalizePeerId(req.body?.peerId);
+
+  if (!pairCode || !peerId) {
+    return res.status(400).json({
+      error: 'Invalid pairCode or peerId'
+    });
+  }
+
+  let peers = pairings.get(pairCode);
+
+  if (!peers) {
+    peers = new Map();
+    pairings.set(pairCode, peers);
+  }
+
+  /*
+   * If this peer is already registered, simply refresh it.
+   */
+  if (peers.has(peerId)) {
+    peers.set(peerId, Date.now());
+
+    return res.json({
+      ok: true,
+      peers: [...peers.keys()].filter((id) => id !== peerId)
+    });
+  }
+
+  /*
+   * Only two peers are allowed in one pairing room.
+   */
+  if (peers.size >= MAX_PEERS_PER_PAIR) {
+    return res.status(409).json({
+      error: 'Pairing room is full'
+    });
+  }
+
+  peers.set(peerId, Date.now());
+
+  console.log(
+    `[PAIR] ${pairCode}: ${peerId.slice(0, 12)}... joined`
+  );
+
+  return res.json({
+    ok: true,
+    peers: [...peers.keys()].filter((id) => id !== peerId)
+  });
+});
+
+/*
+ * Poll the current pairing room.
+ *
+ * GET /pair/:pairCode?peerId=...
+ */
+app.get('/pair/:pairCode', (req, res) => {
+  const pairCode = normalizePairCode(req.params.pairCode);
+  const peerId = normalizePeerId(req.query.peerId);
+
+  if (!pairCode || !peerId) {
+    return res.status(400).json({
+      error: 'Invalid pairCode or peerId'
+    });
+  }
+
+  const peers = pairings.get(pairCode);
+
+  if (!peers) {
+    return res.json({
+      ok: true,
+      peers: []
+    });
+  }
+
+  peers.set(peerId, Date.now());
+
+  return res.json({
+    ok: true,
+    peers: [...peers.keys()].filter((id) => id !== peerId)
+  });
+});
+
+/*
+ * Leave pairing room.
+ */
+app.delete('/pair/:pairCode', (req, res) => {
+  const pairCode = normalizePairCode(req.params.pairCode);
+  const peerId = normalizePeerId(req.query.peerId);
+
+  if (!pairCode || !peerId) {
+    return res.status(400).json({
+      error: 'Invalid pairCode or peerId'
+    });
+  }
+
+  const peers = pairings.get(pairCode);
+
+  if (peers) {
+    peers.delete(peerId);
+
+    if (peers.size === 0) {
+      pairings.delete(pairCode);
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+/*
+ * Start HTTP server.
+ */
 const server = app.listen(PORT, () => {
-  console.log(`[VaultComms] Private Signaling Server running on port ${PORT}`);
+  console.log(
+    `[VaultComms] Signal server listening on port ${PORT}`
+  );
 });
 
-// Mount PeerJS server at /peerjs path
+/*
+ * PeerJS signaling server.
+ *
+ * Client URL:
+ *
+ * https://YOUR-RENDER-DOMAIN.onrender.com/peerjs
+ */
 const peerServer = ExpressPeerServer(server, {
   path: '/',
-  allow_discovery: false,        // Do NOT list connected peers publicly
-  proxied: true,                 // Required for Render.com proxy
-  concurrent_limit: 20,          // Max simultaneous connections
-  cleanup_out_msgs: 1000,
+  allow_discovery: false,
+  proxied: true,
+  concurrent_limit: 20,
+  cleanup_out_msgs: 1000
 });
 
 app.use('/peerjs', peerServer);
 
-// Log connections for debugging (peer ID only, never message content)
 peerServer.on('connection', (client) => {
   const id = client.getId();
-  // Only log first 8 chars of peer ID for debugging
-  console.log(`[+] Peer connected: ${id.substring(0, 8)}...`);
+
+  console.log(
+    `[PEER +] ${id.slice(0, 12)}... connected`
+  );
 });
 
 peerServer.on('disconnect', (client) => {
   const id = client.getId();
-  console.log(`[-] Peer disconnected: ${id.substring(0, 8)}...`);
+
+  removePeerFromAllPairings(id);
+
+  console.log(
+    `[PEER -] ${id.slice(0, 12)}... disconnected`
+  );
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('[VaultComms] Server shutting down...');
+  console.log('[VaultComms] Shutting down...');
   server.close();
 });

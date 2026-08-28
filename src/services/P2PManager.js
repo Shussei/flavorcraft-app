@@ -1,270 +1,763 @@
 import Peer from 'peerjs';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PRIVATE SIGNALING SERVER CONFIG
-// After deploying signal-server/ to Render.com, replace VITE_SIGNAL_HOST
-// in your .env.production file with your Render URL
-// e.g. VITE_SIGNAL_HOST=my-vault-signal.onrender.com
-// ─────────────────────────────────────────────────────────────────────────────
-const SIGNAL_SERVER_HOST = import.meta.env.VITE_SIGNAL_HOST || null;
-const SIGNAL_SERVER_PORT = Number(import.meta.env.VITE_SIGNAL_PORT) || 443;
-const SIGNAL_SERVER_PATH = import.meta.env.VITE_SIGNAL_PATH || '/peerjs';
+const rawSignalHost = import.meta.env.VITE_SIGNAL_HOST || '';
+
+/*
+ * Defensive normalization:
+ * Vercel should contain only:
+ *
+ * flavorcraft-app.onrender.com
+ *
+ * But stripping a protocol here prevents a configuration typo
+ * from breaking PeerJS.
+ */
+const SIGNAL_SERVER_HOST = rawSignalHost
+  .replace(/^https?:\/\//, '')
+  .replace(/\/+$/, '');
+
+const SIGNAL_SERVER_PORT =
+  Number(import.meta.env.VITE_SIGNAL_PORT) || 443;
+
+const SIGNAL_SERVER_PATH =
+  import.meta.env.VITE_SIGNAL_PATH || '/peerjs';
+
+const SIGNAL_ORIGIN = SIGNAL_SERVER_HOST
+  ? `https://${SIGNAL_SERVER_HOST}`
+  : '';
+
+const PAIRING_INTERVAL_MS = 2000;
+
+function createPeerId() {
+  if (window.crypto?.randomUUID) {
+    return `vault-${window.crypto.randomUUID()}`;
+  }
+
+  return `vault-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
 
 class P2PManager {
   constructor() {
     this.peer = null;
     this.peerId = null;
+
+    this.pairCode = null;
+    this.partnerPeerId = null;
+
     this.conn = null;
     this.mediaCall = null;
+
     this.localStream = null;
     this.remoteStream = null;
 
-    this.broadcastChannel = null;
+    this.pairingTimer = null;
+    this.connectionAttemptedFor = null;
+
     this.callbacks = {
-      onConnect: () => {},
-      onDisconnect: () => {},
-      onMessage: () => {},
-      onIncomingCall: () => {},
-      onCallAccepted: () => {},
-      onCallEnded: () => {},
-      onRemoteStream: () => {}
+      onConnect: () => { },
+      onDisconnect: () => { },
+      onMessage: () => { },
+      onIncomingCall: () => { },
+      onCallAccepted: () => { },
+      onCallEnded: () => { },
+      onRemoteStream: () => { },
+      onError: () => { }
     };
   }
 
-  // Initialize P2P Peer with optional custom Peer ID or random key
-  init(customId = null, callbacks = {}) {
-    this.callbacks = { ...this.callbacks, ...callbacks };
+  setCallbacks(callbacks = {}) {
+    this.callbacks = {
+      ...this.callbacks,
+      ...callbacks
+    };
+  }
 
-    // Set up local BroadcastChannel fallback for multi-tab testing
-    if ('BroadcastChannel' in window) {
-      if (this.broadcastChannel) this.broadcastChannel.close();
-      this.broadcastChannel = new BroadcastChannel('vaultcomms-p2p-channel');
-      this.broadcastChannel.onmessage = (event) => {
-        this.handleBroadcastMessage(event.data);
-      };
+  init(pairCode, callbacks = {}) {
+    this.cleanup();
+
+    this.pairCode = String(pairCode || '').trim();
+
+    this.setCallbacks(callbacks);
+
+    if (!this.pairCode) {
+      this.callbacks.onError(
+        new Error('Pair code is required')
+      );
+      return null;
     }
 
-    try {
-      const randomSuffix = Math.floor(1000 + Math.random() * 9000);
-      this.peerId = customId || `vault-${randomSuffix}`;
+    if (!SIGNAL_SERVER_HOST) {
+      const error = new Error(
+        'VITE_SIGNAL_HOST is not configured'
+      );
 
-      // Build PeerJS config:
-      // If VITE_SIGNAL_HOST is set → use your private Render.com server
-      // Otherwise → fall back to PeerJS public cloud (testing only)
-      const peerConfig = {
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
-          ]
-        }
-      };
+      console.error(error);
+      this.callbacks.onError(error);
 
-      if (SIGNAL_SERVER_HOST) {
-        peerConfig.host = SIGNAL_SERVER_HOST;
-        peerConfig.port = SIGNAL_SERVER_PORT;
-        peerConfig.path = SIGNAL_SERVER_PATH;
-        peerConfig.secure = true;
+      return null;
+    }
+
+    this.peerId = createPeerId();
+
+    const peerConfig = {
+      debug: 2,
+
+      host: SIGNAL_SERVER_HOST,
+      port: SIGNAL_SERVER_PORT,
+      path: SIGNAL_SERVER_PATH,
+      secure: true,
+
+      config: {
+        iceServers: [
+          {
+            urls: 'stun:stun.l.google.com:19302'
+          },
+          {
+            urls: 'stun:stun1.l.google.com:19302'
+          }
+        ]
       }
+    };
 
-      this.peer = new Peer(this.peerId, peerConfig);
+    console.log(
+      '[P2P] Creating peer:',
+      this.peerId
+    );
 
-      this.peer.on('open', (id) => {
-        this.peerId = id;
-      });
+    console.log(
+      '[P2P] Signal server:',
+      `https://${SIGNAL_SERVER_HOST}${SIGNAL_SERVER_PATH}`
+    );
 
-      this.peer.on('connection', (connection) => {
-        this.conn = connection;
-        this.setupDataConnection();
-      });
+    try {
+      this.peer = new Peer(
+        this.peerId,
+        peerConfig
+      );
 
-      this.peer.on('call', (call) => {
-        this.mediaCall = call;
-        this.callbacks.onIncomingCall({ isVideo: false, callerId: call.peer });
-      });
+      this.registerPeerEvents();
+    } catch (error) {
+      console.error(
+        '[P2P] Peer initialization failed:',
+        error
+      );
 
-      this.peer.on('error', (err) => {
-        console.warn('PeerJS fallback mode:', err);
-      });
-    } catch (err) {
-      console.warn('PeerJS init fallback:', err);
+      this.callbacks.onError(error);
     }
 
     return this.peerId;
   }
 
-  // Connect to target Peer by ID / Room Code
-  connectToPeer(targetPeerId) {
-    if (this.peer) {
-      try {
-        this.conn = this.peer.connect(targetPeerId, { reliable: true });
-        this.setupDataConnection();
-      } catch (err) {
-        console.warn('Direct connection retry fallback');
-      }
-    }
+  registerPeerEvents() {
+    if (!this.peer) return;
 
-    // Also broadcast connect intent over local channel for dual tab
-    this.broadcastMessage({ type: 'SIGNAL_PEER_JOIN', senderId: this.peerId, targetId: targetPeerId });
-  }
+    this.peer.on('open', async (id) => {
+      this.peerId = id;
 
-  setupDataConnection() {
-    if (!this.conn) return;
+      console.log(
+        '[P2P] Connected to PeerServer:',
+        id
+      );
 
-    this.conn.on('open', () => {
-      this.callbacks.onConnect({ peerId: this.conn.peer });
+      await this.registerPairing();
+
+      this.startPairingPolling();
     });
 
-    this.conn.on('data', (data) => {
+    this.peer.on('connection', (connection) => {
+      console.log(
+        '[P2P] Incoming data connection from:',
+        connection.peer
+      );
+
+      /*
+       * Only accept connections belonging to the current pairing.
+       */
+      if (
+        this.partnerPeerId &&
+        connection.peer !== this.partnerPeerId
+      ) {
+        console.warn(
+          '[P2P] Ignoring unexpected peer:',
+          connection.peer
+        );
+
+        connection.close();
+        return;
+      }
+
+      this.partnerPeerId = connection.peer;
+
+      this.setupDataConnection(connection);
+    });
+
+    this.peer.on('call', (call) => {
+      console.log(
+        '[P2P] Incoming media call from:',
+        call.peer
+      );
+
+      if (
+        this.partnerPeerId &&
+        call.peer !== this.partnerPeerId
+      ) {
+        call.close();
+        return;
+      }
+
+      this.partnerPeerId = call.peer;
+      this.mediaCall = call;
+
+      this.callbacks.onIncomingCall({
+        isVideo: Boolean(call.metadata?.isVideo),
+        callerId: call.peer
+      });
+    });
+
+    this.peer.on('disconnected', () => {
+      console.warn(
+        '[P2P] Disconnected from PeerServer'
+      );
+
+      this.callbacks.onDisconnect();
+
+      /*
+       * PeerJS supports reconnecting an existing peer ID.
+       */
+      if (this.peer && !this.peer.destroyed) {
+        setTimeout(() => {
+          try {
+            this.peer.reconnect();
+          } catch (error) {
+            console.error(
+              '[P2P] Reconnect failed:',
+              error
+            );
+          }
+        }, 1500);
+      }
+    });
+
+    this.peer.on('close', () => {
+      console.warn('[P2P] Peer closed');
+
+      this.callbacks.onDisconnect();
+    });
+
+    this.peer.on('error', (error) => {
+      console.error(
+        '[P2P] PeerJS error:',
+        error.type,
+        error
+      );
+
+      this.callbacks.onError(error);
+
+      if (
+        error.type === 'unavailable-id' ||
+        error.type === 'invalid-id'
+      ) {
+        this.callbacks.onDisconnect();
+      }
+    });
+  }
+
+  async registerPairing() {
+    if (!SIGNAL_ORIGIN || !this.pairCode || !this.peerId) {
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `${SIGNAL_ORIGIN}/pair/join`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            pairCode: this.pairCode,
+            peerId: this.peerId
+          })
+        }
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+
+        throw new Error(
+          `Pairing server returned ${response.status}: ${body}`
+        );
+      }
+
+      const result = await response.json();
+
+      this.processDiscoveredPeers(result.peers || []);
+    } catch (error) {
+      console.error(
+        '[P2P] Pairing registration failed:',
+        error
+      );
+
+      this.callbacks.onError(error);
+    }
+  }
+
+  startPairingPolling() {
+    this.stopPairingPolling();
+
+    this.pairingTimer = setInterval(() => {
+      this.pollPairing();
+    }, PAIRING_INTERVAL_MS);
+  }
+
+  stopPairingPolling() {
+    if (this.pairingTimer) {
+      clearInterval(this.pairingTimer);
+      this.pairingTimer = null;
+    }
+  }
+
+  async pollPairing() {
+    if (
+      !SIGNAL_ORIGIN ||
+      !this.pairCode ||
+      !this.peerId
+    ) {
+      return;
+    }
+
+    try {
+      const url =
+        `${SIGNAL_ORIGIN}/pair/` +
+        `${encodeURIComponent(this.pairCode)}` +
+        `?peerId=${encodeURIComponent(this.peerId)}`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(
+          `Pairing poll returned ${response.status}`
+        );
+      }
+
+      const result = await response.json();
+
+      this.processDiscoveredPeers(result.peers || []);
+    } catch (error) {
+      console.error(
+        '[P2P] Pairing poll failed:',
+        error
+      );
+    }
+  }
+
+  processDiscoveredPeers(peers) {
+    const candidates = peers.filter(
+      (id) =>
+        id &&
+        id !== this.peerId
+    );
+
+    if (candidates.length === 0) {
+      this.callbacks.onDisconnect();
+      return;
+    }
+
+    /*
+     * Deterministic initiator:
+     *
+     * Only the lexicographically smaller peer ID
+     * initiates the data connection.
+     *
+     * This prevents both phones from simultaneously
+     * creating duplicate connections.
+     */
+    candidates.sort();
+
+    const targetPeerId = candidates[0];
+
+    this.partnerPeerId = targetPeerId;
+
+    if (
+      this.conn?.open &&
+      this.conn.peer === targetPeerId
+    ) {
+      return;
+    }
+
+    if (
+      this.peerId &&
+      this.peerId < targetPeerId
+    ) {
+      this.connectToPeer(targetPeerId);
+    }
+  }
+
+  connectToPeer(targetPeerId) {
+    if (
+      !this.peer ||
+      this.peer.destroyed ||
+      !targetPeerId
+    ) {
+      return;
+    }
+
+    if (
+      this.conn?.open &&
+      this.conn.peer === targetPeerId
+    ) {
+      return;
+    }
+
+    if (
+      this.connectionAttemptedFor === targetPeerId
+    ) {
+      return;
+    }
+
+    this.connectionAttemptedFor = targetPeerId;
+    this.partnerPeerId = targetPeerId;
+
+    console.log(
+      '[P2P] Connecting to:',
+      targetPeerId
+    );
+
+    try {
+      const connection = this.peer.connect(
+        targetPeerId,
+        {
+          reliable: true,
+          serialization: 'json',
+          metadata: {
+            pairCode: this.pairCode
+          }
+        }
+      );
+
+      this.setupDataConnection(connection);
+    } catch (error) {
+      this.connectionAttemptedFor = null;
+
+      console.error(
+        '[P2P] Connection attempt failed:',
+        error
+      );
+
+      this.callbacks.onError(error);
+    }
+  }
+
+  setupDataConnection(connection) {
+    if (!connection) return;
+
+    connection.on('open', () => {
+      console.log(
+        '[P2P] Data connection OPEN:',
+        connection.peer
+      );
+
+      this.conn = connection;
+      this.partnerPeerId = connection.peer;
+      this.connectionAttemptedFor = connection.peer;
+
+      this.callbacks.onConnect({
+        peerId: connection.peer
+      });
+    });
+
+    connection.on('data', (data) => {
       this.handleIncomingData(data);
     });
 
-    this.conn.on('close', () => {
+    connection.on('close', () => {
+      if (
+        this.conn === connection
+      ) {
+        this.conn = null;
+      }
+
+      this.connectionAttemptedFor = null;
+
+      console.warn(
+        '[P2P] Data connection closed'
+      );
+
       this.callbacks.onDisconnect();
     });
-  }
 
-  // Send encrypted message to peer
-  sendMessage(msgObject) {
-    const payload = { ...msgObject, senderId: this.peerId };
+    connection.on('error', (error) => {
+      console.error(
+        '[P2P] Data connection error:',
+        error
+      );
 
-    // Send via PeerJS connection if open
-    if (this.conn && this.conn.open) {
-      this.conn.send(payload);
-    }
-
-    // Always broadcast via BroadcastChannel so dual tabs on same PC get instant sync!
-    this.broadcastMessage({ type: 'CHAT_MESSAGE', payload });
-  }
-
-  // Handle incoming data payload
-  handleIncomingData(data) {
-    if (data.type === 'CALL_REQUEST') {
-      this.callbacks.onIncomingCall(data);
-    } else if (data.type === 'CALL_ACCEPT') {
-      this.callbacks.onCallAccepted(data);
-    } else if (data.type === 'CALL_REJECT' || data.type === 'CALL_END') {
-      this.callbacks.onCallEnded(data);
-    } else {
-      this.callbacks.onMessage(data);
-    }
-  }
-
-  // Broadcast Channel helper for local browser tabs
-  broadcastMessage(msg) {
-    if (this.broadcastChannel) {
-      this.broadcastChannel.postMessage({ ...msg, senderId: this.peerId });
-    }
-  }
-
-  handleBroadcastMessage(data) {
-    if (data.senderId === this.peerId) return; // Ignore own messages
-
-    if (data.type === 'CHAT_MESSAGE') {
-      this.callbacks.onMessage(data.payload);
-    } else if (data.type === 'CALL_REQUEST') {
-      this.callbacks.onIncomingCall(data);
-    } else if (data.type === 'CALL_ACCEPT') {
-      this.callbacks.onCallAccepted(data);
-    } else if (data.type === 'CALL_REJECT' || data.type === 'CALL_END') {
-      this.callbacks.onCallEnded(data);
-    } else if (data.type === 'SIGNAL_PEER_JOIN') {
-      this.callbacks.onConnect({ peerId: data.senderId });
-    }
-  }
-
-  // --- Voice & Video WebRTC Call Stream Management ---
-  async startLocalMedia(video = false) {
-    try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: video
-      });
-      return this.localStream;
-    } catch (err) {
-      console.warn('Microphone/Camera permission notice:', err);
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = audioCtx.createOscillator();
-      const dst = audioCtx.createMediaStreamDestination();
-      osc.connect(dst);
-      osc.start();
-      this.localStream = dst.stream;
-      return this.localStream;
-    }
-  }
-
-  async callPeer(targetPeerId, isVideo = false) {
-    await this.startLocalMedia(isVideo);
-
-    // Send call request signal
-    const callSignal = { type: 'CALL_REQUEST', isVideo, callerId: this.peerId };
-    if (this.conn && this.conn.open) {
-      this.conn.send(callSignal);
-    }
-    this.broadcastMessage(callSignal);
-
-    if (this.peer && targetPeerId) {
-      try {
-        this.mediaCall = this.peer.call(targetPeerId, this.localStream);
-        if (this.mediaCall) {
-          this.mediaCall.on('stream', (remoteStream) => {
-            this.remoteStream = remoteStream;
-            this.callbacks.onRemoteStream(remoteStream);
-          });
-        }
-      } catch (e) {
-        console.warn('Peer call fallback active');
+      if (this.conn === connection) {
+        this.conn = null;
       }
-    }
-  }
 
-  answerCall(isVideo = false) {
-    this.startLocalMedia(isVideo).then((stream) => {
-      if (this.mediaCall) {
-        this.mediaCall.answer(stream);
-        this.mediaCall.on('stream', (remoteStream) => {
-          this.remoteStream = remoteStream;
-          this.callbacks.onRemoteStream(remoteStream);
-        });
-      }
-      const acceptSignal = { type: 'CALL_ACCEPT', isVideo, responderId: this.peerId };
-      if (this.conn && this.conn.open) this.conn.send(acceptSignal);
-      this.broadcastMessage(acceptSignal);
+      this.connectionAttemptedFor = null;
+
+      this.callbacks.onDisconnect();
+      this.callbacks.onError(error);
     });
+  }
+
+  handleIncomingData(data) {
+    if (!data || typeof data !== 'object') {
+      return;
+    }
+
+    switch (data.type) {
+      case 'CALL_REQUEST':
+        this.callbacks.onIncomingCall(data);
+        break;
+
+      case 'CALL_ACCEPT':
+        this.callbacks.onCallAccepted(data);
+        break;
+
+      case 'CALL_REJECT':
+      case 'CALL_END':
+        this.callbacks.onCallEnded(data);
+        break;
+
+      default:
+        this.callbacks.onMessage(data);
+    }
+  }
+
+  sendMessage(message) {
+    if (
+      !this.conn ||
+      !this.conn.open
+    ) {
+      console.warn(
+        '[P2P] Message not sent: no open data connection'
+      );
+
+      return false;
+    }
+
+    try {
+      this.conn.send({
+        ...message,
+        senderId: this.peerId
+      });
+
+      return true;
+    } catch (error) {
+      console.error(
+        '[P2P] Failed to send message:',
+        error
+      );
+
+      return false;
+    }
+  }
+
+  async startLocalMedia(video = false) {
+    if (
+      !navigator.mediaDevices?.getUserMedia
+    ) {
+      throw new Error(
+        'Media capture is not available in this browser'
+      );
+    }
+
+    this.localStream =
+      await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video
+      });
+
+    return this.localStream;
+  }
+
+  async callPeer(
+    targetPeerId = null,
+    isVideo = false
+  ) {
+    const target =
+      targetPeerId ||
+      this.partnerPeerId;
+
+    if (!target) {
+      throw new Error(
+        'No paired device is connected'
+      );
+    }
+
+    if (
+      !this.peer ||
+      this.peer.destroyed
+    ) {
+      throw new Error(
+        'Peer connection is not initialized'
+      );
+    }
+
+    const stream =
+      await this.startLocalMedia(isVideo);
+
+    const call =
+      this.peer.call(
+        target,
+        stream,
+        {
+          metadata: {
+            isVideo
+          }
+        }
+      );
+
+    this.mediaCall = call;
+
+    call.on('stream', (remoteStream) => {
+      this.remoteStream = remoteStream;
+
+      this.callbacks.onRemoteStream(
+        remoteStream
+      );
+
+      this.callbacks.onCallAccepted({
+        peerId: target
+      });
+    });
+
+    call.on('close', () => {
+      this.callbacks.onCallEnded();
+    });
+
+    call.on('error', (error) => {
+      console.error(
+        '[P2P] Media call error:',
+        error
+      );
+
+      this.callbacks.onCallEnded();
+      this.callbacks.onError(error);
+    });
+
+    return stream;
+  }
+
+  async answerCall(isVideo = false) {
+    if (!this.mediaCall) {
+      throw new Error(
+        'No incoming call to answer'
+      );
+    }
+
+    const stream =
+      await this.startLocalMedia(isVideo);
+
+    this.mediaCall.answer(stream);
+
+    this.mediaCall.on('stream', (remoteStream) => {
+      this.remoteStream = remoteStream;
+
+      this.callbacks.onRemoteStream(
+        remoteStream
+      );
+    });
+
+    this.mediaCall.on('close', () => {
+      this.callbacks.onCallEnded();
+    });
+
+    return stream;
   }
 
   endCall() {
-    const endSignal = { type: 'CALL_END', senderId: this.peerId };
-    if (this.conn && this.conn.open) this.conn.send(endSignal);
-    this.broadcastMessage(endSignal);
-
     if (this.mediaCall) {
-      this.mediaCall.close();
+      try {
+        this.mediaCall.close();
+      } catch {
+        // Ignore already closed media connections.
+      }
+
       this.mediaCall = null;
     }
+
     if (this.localStream) {
-      this.localStream.getTracks().forEach((t) => t.stop());
+      this.localStream
+        .getTracks()
+        .forEach((track) => track.stop());
+
       this.localStream = null;
     }
+
     this.remoteStream = null;
+
     this.callbacks.onCallEnded();
   }
 
   toggleMicrophone(enabled) {
-    if (this.localStream) {
-      this.localStream.getAudioTracks().forEach((track) => {
+    if (!this.localStream) return;
+
+    this.localStream
+      .getAudioTracks()
+      .forEach((track) => {
         track.enabled = enabled;
       });
-    }
   }
 
   toggleCamera(enabled) {
-    if (this.localStream) {
-      this.localStream.getVideoTracks().forEach((track) => {
+    if (!this.localStream) return;
+
+    this.localStream
+      .getVideoTracks()
+      .forEach((track) => {
         track.enabled = enabled;
       });
+  }
+
+  async leavePairing() {
+    if (
+      !SIGNAL_ORIGIN ||
+      !this.pairCode ||
+      !this.peerId
+    ) {
+      return;
     }
+
+    try {
+      await fetch(
+        `${SIGNAL_ORIGIN}/pair/` +
+        `${encodeURIComponent(this.pairCode)}` +
+        `?peerId=${encodeURIComponent(this.peerId)}`,
+        {
+          method: 'DELETE'
+        }
+      );
+    } catch (error) {
+      console.warn(
+        '[P2P] Failed to leave pairing room:',
+        error
+      );
+    }
+  }
+
+  cleanup() {
+    this.stopPairingPolling();
+
+    if (this.peer) {
+      try {
+        this.peer.destroy();
+      } catch {
+        // Ignore already-destroyed peers.
+      }
+    }
+
+    this.peer = null;
+    this.peerId = null;
+    this.partnerPeerId = null;
+    this.conn = null;
+    this.mediaCall = null;
+    this.connectionAttemptedFor = null;
   }
 }
 
