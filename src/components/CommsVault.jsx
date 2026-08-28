@@ -15,16 +15,7 @@ export default function CommsVault({
   decoyPin,
   setDecoyPin
 }) {
-  const [messages, setMessages] = useState([
-    {
-      id: 'welcome-msg',
-      sender: 'partner',
-      text: 'Hey love! I am on the secret app now. Comms are safe and encrypted. ❤️',
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      type: 'text',
-      ttl: null
-    }
-  ]);
+  const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [partnerName, setPartnerName] = useState('My Love');
   const [pairCode, setPairCode] = useState('PAIR-1314');
