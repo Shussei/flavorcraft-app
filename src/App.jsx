@@ -14,7 +14,7 @@ export default function App() {
   const [appMode, setAppMode] = useState('cookbook');
 
   const [secretPin, setSecretPin] =
-    useState('1314');
+    useState('1515');
 
   const [decoyPin, setDecoyPin] =
     useState('0000');
