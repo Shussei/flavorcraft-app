@@ -1,16 +1,8 @@
 import Peer from 'peerjs';
 
-const rawSignalHost = import.meta.env.VITE_SIGNAL_HOST || '';
+const rawSignalHost =
+  import.meta.env.VITE_SIGNAL_HOST || '';
 
-/*
- * Defensive normalization:
- * Vercel should contain only:
- *
- * flavorcraft-app.onrender.com
- *
- * But stripping a protocol here prevents a configuration typo
- * from breaking PeerJS.
- */
 const SIGNAL_SERVER_HOST = rawSignalHost
   .replace(/^https?:\/\//, '')
   .replace(/\/+$/, '');
@@ -26,6 +18,7 @@ const SIGNAL_ORIGIN = SIGNAL_SERVER_HOST
   : '';
 
 const PAIRING_INTERVAL_MS = 2000;
+const RECONNECT_DELAY_MS = 2000;
 
 function createPeerId() {
   if (window.crypto?.randomUUID) {
@@ -52,7 +45,12 @@ class P2PManager {
     this.remoteStream = null;
 
     this.pairingTimer = null;
+    this.reconnectTimer = null;
+
     this.connectionAttemptedFor = null;
+
+    this.destroying = false;
+    this.isConnected = false;
 
     this.callbacks = {
       onConnect: () => { },
@@ -76,14 +74,20 @@ class P2PManager {
   init(pairCode, callbacks = {}) {
     this.cleanup();
 
-    this.pairCode = String(pairCode || '').trim();
+    this.destroying = false;
+
+    this.pairCode =
+      String(pairCode || '').trim();
 
     this.setCallbacks(callbacks);
 
     if (!this.pairCode) {
-      this.callbacks.onError(
-        new Error('Pair code is required')
+      const error = new Error(
+        'Pair code is required'
       );
+
+      this.callbacks.onError(error);
+
       return null;
     }
 
@@ -92,7 +96,11 @@ class P2PManager {
         'VITE_SIGNAL_HOST is not configured'
       );
 
-      console.error(error);
+      console.error(
+        '[P2P]',
+        error
+      );
+
       this.callbacks.onError(error);
 
       return null;
@@ -127,7 +135,7 @@ class P2PManager {
 
     console.log(
       '[P2P] Signal server:',
-      `https://${SIGNAL_SERVER_HOST}${SIGNAL_SERVER_PATH}`
+      `${SIGNAL_ORIGIN}${SIGNAL_SERVER_PATH}`
     );
 
     try {
@@ -153,6 +161,8 @@ class P2PManager {
     if (!this.peer) return;
 
     this.peer.on('open', async (id) => {
+      if (this.destroying) return;
+
       this.peerId = id;
 
       console.log(
@@ -160,26 +170,37 @@ class P2PManager {
         id
       );
 
-      await this.registerPairing();
+      try {
+        await this.registerPairing();
 
-      this.startPairingPolling();
+        if (!this.destroying) {
+          this.startPairingPolling();
+        }
+      } catch (error) {
+        console.error(
+          '[P2P] Initial pairing registration failed:',
+          error
+        );
+      }
     });
 
     this.peer.on('connection', (connection) => {
+      if (this.destroying) {
+        connection.close();
+        return;
+      }
+
       console.log(
         '[P2P] Incoming data connection from:',
         connection.peer
       );
 
-      /*
-       * Only accept connections belonging to the current pairing.
-       */
       if (
         this.partnerPeerId &&
         connection.peer !== this.partnerPeerId
       ) {
         console.warn(
-          '[P2P] Ignoring unexpected peer:',
+          '[P2P] Rejecting unexpected peer:',
           connection.peer
         );
 
@@ -187,12 +208,32 @@ class P2PManager {
         return;
       }
 
-      this.partnerPeerId = connection.peer;
+      this.partnerPeerId =
+        connection.peer;
 
-      this.setupDataConnection(connection);
+      /*
+       * If we already have an open connection,
+       * don't replace it with another one.
+       */
+      if (
+        this.conn?.open &&
+        this.conn.peer === connection.peer
+      ) {
+        connection.close();
+        return;
+      }
+
+      this.setupDataConnection(
+        connection
+      );
     });
 
     this.peer.on('call', (call) => {
+      if (this.destroying) {
+        call.close();
+        return;
+      }
+
       console.log(
         '[P2P] Incoming media call from:',
         call.peer
@@ -206,46 +247,58 @@ class P2PManager {
         return;
       }
 
-      this.partnerPeerId = call.peer;
+      this.partnerPeerId =
+        call.peer;
+
       this.mediaCall = call;
 
       this.callbacks.onIncomingCall({
-        isVideo: Boolean(call.metadata?.isVideo),
+        isVideo:
+          Boolean(
+            call.metadata?.isVideo
+          ),
         callerId: call.peer
       });
     });
 
+    /*
+     * IMPORTANT:
+     *
+     * Do not blindly call reconnect().
+     * PeerJS can transition back to connected state
+     * before our timeout executes.
+     */
     this.peer.on('disconnected', () => {
+      if (this.destroying) return;
+
       console.warn(
         '[P2P] Disconnected from PeerServer'
       );
 
+      this.isConnected = false;
+
       this.callbacks.onDisconnect();
 
-      /*
-       * PeerJS supports reconnecting an existing peer ID.
-       */
-      if (this.peer && !this.peer.destroyed) {
-        setTimeout(() => {
-          try {
-            this.peer.reconnect();
-          } catch (error) {
-            console.error(
-              '[P2P] Reconnect failed:',
-              error
-            );
-          }
-        }, 1500);
-      }
+      this.scheduleReconnect();
     });
 
     this.peer.on('close', () => {
-      console.warn('[P2P] Peer closed');
+      if (this.destroying) return;
+
+      console.warn(
+        '[P2P] Peer closed'
+      );
+
+      this.isConnected = false;
+
+      this.stopPairingPolling();
 
       this.callbacks.onDisconnect();
     });
 
     this.peer.on('error', (error) => {
+      if (this.destroying) return;
+
       console.error(
         '[P2P] PeerJS error:',
         error.type,
@@ -254,6 +307,10 @@ class P2PManager {
 
       this.callbacks.onError(error);
 
+      /*
+       * unavailable-id should never normally happen
+       * because IDs are UUID-based.
+       */
       if (
         error.type === 'unavailable-id' ||
         error.type === 'invalid-id'
@@ -263,64 +320,131 @@ class P2PManager {
     });
   }
 
-  async registerPairing() {
-    if (!SIGNAL_ORIGIN || !this.pairCode || !this.peerId) {
+  scheduleReconnect() {
+    if (this.reconnectTimer) {
       return;
     }
 
-    try {
-      const response = await fetch(
+    this.reconnectTimer =
+      setTimeout(() => {
+        this.reconnectTimer = null;
+
+        if (
+          this.destroying ||
+          !this.peer ||
+          this.peer.destroyed
+        ) {
+          return;
+        }
+
+        /*
+         * Only call reconnect while PeerJS
+         * actually reports itself disconnected.
+         */
+        if (!this.peer.disconnected) {
+          console.log(
+            '[P2P] Peer already reconnected'
+          );
+
+          return;
+        }
+
+        try {
+          console.log(
+            '[P2P] Reconnecting to PeerServer...'
+          );
+
+          this.peer.reconnect();
+        } catch (error) {
+          console.error(
+            '[P2P] Reconnect failed:',
+            error
+          );
+
+          this.callbacks.onError(error);
+        }
+      }, RECONNECT_DELAY_MS);
+  }
+
+  async registerPairing() {
+    if (
+      !SIGNAL_ORIGIN ||
+      !this.pairCode ||
+      !this.peerId
+    ) {
+      return;
+    }
+
+    const response =
+      await fetch(
         `${SIGNAL_ORIGIN}/pair/join`,
         {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json'
+            'Content-Type':
+              'application/json'
           },
           body: JSON.stringify({
-            pairCode: this.pairCode,
-            peerId: this.peerId
+            pairCode:
+              this.pairCode,
+            peerId:
+              this.peerId
           })
         }
       );
 
-      if (!response.ok) {
-        const body = await response.text();
+    if (!response.ok) {
+      const body =
+        await response.text();
 
-        throw new Error(
-          `Pairing server returned ${response.status}: ${body}`
-        );
-      }
-
-      const result = await response.json();
-
-      this.processDiscoveredPeers(result.peers || []);
-    } catch (error) {
-      console.error(
-        '[P2P] Pairing registration failed:',
-        error
+      throw new Error(
+        `Pairing server returned ${response.status}: ${body}`
       );
-
-      this.callbacks.onError(error);
     }
+
+    const result =
+      await response.json();
+
+    console.log(
+      '[P2P] Pairing registered:',
+      result.peers
+    );
+
+    this.processDiscoveredPeers(
+      result.peers || []
+    );
   }
 
   startPairingPolling() {
     this.stopPairingPolling();
 
-    this.pairingTimer = setInterval(() => {
-      this.pollPairing();
-    }, PAIRING_INTERVAL_MS);
+    /*
+     * Immediate poll.
+     */
+    this.pollPairing();
+
+    this.pairingTimer =
+      setInterval(
+        () => {
+          this.pollPairing();
+        },
+        PAIRING_INTERVAL_MS
+      );
   }
 
   stopPairingPolling() {
     if (this.pairingTimer) {
-      clearInterval(this.pairingTimer);
+      clearInterval(
+        this.pairingTimer
+      );
+
       this.pairingTimer = null;
     }
   }
 
   async pollPairing() {
     if (
+      this.destroying ||
       !SIGNAL_ORIGIN ||
       !this.pairCode ||
       !this.peerId
@@ -331,10 +455,15 @@ class P2PManager {
     try {
       const url =
         `${SIGNAL_ORIGIN}/pair/` +
-        `${encodeURIComponent(this.pairCode)}` +
-        `?peerId=${encodeURIComponent(this.peerId)}`;
+        `${encodeURIComponent(
+          this.pairCode
+        )}` +
+        `?peerId=${encodeURIComponent(
+          this.peerId
+        )}`;
 
-      const response = await fetch(url);
+      const response =
+        await fetch(url);
 
       if (!response.ok) {
         throw new Error(
@@ -342,9 +471,12 @@ class P2PManager {
         );
       }
 
-      const result = await response.json();
+      const result =
+        await response.json();
 
-      this.processDiscoveredPeers(result.peers || []);
+      this.processDiscoveredPeers(
+        result.peers || []
+      );
     } catch (error) {
       console.error(
         '[P2P] Pairing poll failed:',
@@ -354,51 +486,85 @@ class P2PManager {
   }
 
   processDiscoveredPeers(peers) {
-    const candidates = peers.filter(
-      (id) =>
-        id &&
-        id !== this.peerId
-    );
+    if (this.destroying) {
+      return;
+    }
 
-    if (candidates.length === 0) {
+    const candidates =
+      Array.isArray(peers)
+        ? peers.filter(
+          (id) =>
+            id &&
+            id !== this.peerId
+        )
+        : [];
+
+    if (
+      candidates.length === 0
+    ) {
+      this.partnerPeerId = null;
+      this.isConnected = false;
+
       this.callbacks.onDisconnect();
+
+      return;
+    }
+
+    /*
+     * We only support exactly one partner.
+     */
+    candidates.sort();
+
+    const targetPeerId =
+      candidates[0];
+
+    this.partnerPeerId =
+      targetPeerId;
+
+    /*
+     * Existing healthy connection.
+     */
+    if (
+      this.conn?.open &&
+      this.conn.peer ===
+      targetPeerId
+    ) {
+      return;
+    }
+
+    /*
+     * If a connection attempt is already
+     * in progress for this peer, wait.
+     */
+    if (
+      this.connectionAttemptedFor ===
+      targetPeerId
+    ) {
       return;
     }
 
     /*
      * Deterministic initiator:
      *
-     * Only the lexicographically smaller peer ID
-     * initiates the data connection.
-     *
-     * This prevents both phones from simultaneously
-     * creating duplicate connections.
+     * The lexicographically smaller UUID
+     * creates the outbound connection.
      */
-    candidates.sort();
-
-    const targetPeerId = candidates[0];
-
-    this.partnerPeerId = targetPeerId;
-
     if (
-      this.conn?.open &&
-      this.conn.peer === targetPeerId
+      this.peerId <
+      targetPeerId
     ) {
-      return;
-    }
-
-    if (
-      this.peerId &&
-      this.peerId < targetPeerId
-    ) {
-      this.connectToPeer(targetPeerId);
+      this.connectToPeer(
+        targetPeerId
+      );
     }
   }
 
   connectToPeer(targetPeerId) {
     if (
+      this.destroying ||
       !this.peer ||
       this.peer.destroyed ||
+      this.peer.disconnected ||
       !targetPeerId
     ) {
       return;
@@ -406,19 +572,24 @@ class P2PManager {
 
     if (
       this.conn?.open &&
-      this.conn.peer === targetPeerId
+      this.conn.peer ===
+      targetPeerId
     ) {
       return;
     }
 
     if (
-      this.connectionAttemptedFor === targetPeerId
+      this.connectionAttemptedFor ===
+      targetPeerId
     ) {
       return;
     }
 
-    this.connectionAttemptedFor = targetPeerId;
-    this.partnerPeerId = targetPeerId;
+    this.connectionAttemptedFor =
+      targetPeerId;
+
+    this.partnerPeerId =
+      targetPeerId;
 
     console.log(
       '[P2P] Connecting to:',
@@ -426,50 +597,95 @@ class P2PManager {
     );
 
     try {
-      const connection = this.peer.connect(
-        targetPeerId,
-        {
-          reliable: true,
-          serialization: 'json',
-          metadata: {
-            pairCode: this.pairCode
+      const connection =
+        this.peer.connect(
+          targetPeerId,
+          {
+            reliable: true,
+            serialization: 'json',
+            metadata: {
+              pairCode:
+                this.pairCode
+            }
           }
-        }
-      );
+        );
 
-      this.setupDataConnection(connection);
+      this.setupDataConnection(
+        connection
+      );
     } catch (error) {
-      this.connectionAttemptedFor = null;
+      this.connectionAttemptedFor =
+        null;
 
       console.error(
         '[P2P] Connection attempt failed:',
         error
       );
 
-      this.callbacks.onError(error);
+      this.callbacks.onError(
+        error
+      );
     }
   }
 
-  setupDataConnection(connection) {
-    if (!connection) return;
+  setupDataConnection(
+    connection
+  ) {
+    if (!connection) {
+      return;
+    }
+
+    let opened = false;
 
     connection.on('open', () => {
+      if (this.destroying) {
+        connection.close();
+        return;
+      }
+
+      opened = true;
+
       console.log(
         '[P2P] Data connection OPEN:',
         connection.peer
       );
 
-      this.conn = connection;
-      this.partnerPeerId = connection.peer;
-      this.connectionAttemptedFor = connection.peer;
+      /*
+       * Only accept the connection if it
+       * belongs to our pairing.
+       */
+      if (
+        this.partnerPeerId &&
+        this.partnerPeerId !==
+        connection.peer
+      ) {
+        connection.close();
+        return;
+      }
 
+      this.conn = connection;
+
+      this.partnerPeerId =
+        connection.peer;
+
+      this.connectionAttemptedFor =
+        connection.peer;
+
+      this.isConnected = true;
+
+      /*
+       * Stop creating additional connections.
+       */
       this.callbacks.onConnect({
-        peerId: connection.peer
+        peerId:
+          connection.peer
       });
     });
 
     connection.on('data', (data) => {
-      this.handleIncomingData(data);
+      this.handleIncomingData(
+        data
+      );
     });
 
     connection.on('close', () => {
@@ -477,15 +693,25 @@ class P2PManager {
         this.conn === connection
       ) {
         this.conn = null;
+        this.isConnected = false;
       }
 
-      this.connectionAttemptedFor = null;
+      if (
+        this.connectionAttemptedFor ===
+        connection.peer
+      ) {
+        this.connectionAttemptedFor =
+          null;
+      }
 
       console.warn(
-        '[P2P] Data connection closed'
+        '[P2P] Data connection closed:',
+        connection.peer
       );
 
-      this.callbacks.onDisconnect();
+      if (opened) {
+        this.callbacks.onDisconnect();
+      }
     });
 
     connection.on('error', (error) => {
@@ -494,38 +720,60 @@ class P2PManager {
         error
       );
 
-      if (this.conn === connection) {
+      if (
+        this.conn === connection
+      ) {
         this.conn = null;
+        this.isConnected = false;
       }
 
-      this.connectionAttemptedFor = null;
+      if (
+        this.connectionAttemptedFor ===
+        connection.peer
+      ) {
+        this.connectionAttemptedFor =
+          null;
+      }
 
       this.callbacks.onDisconnect();
-      this.callbacks.onError(error);
+      this.callbacks.onError(
+        error
+      );
     });
   }
 
   handleIncomingData(data) {
-    if (!data || typeof data !== 'object') {
+    if (
+      !data ||
+      typeof data !== 'object'
+    ) {
       return;
     }
 
     switch (data.type) {
       case 'CALL_REQUEST':
-        this.callbacks.onIncomingCall(data);
+        this.callbacks.onIncomingCall(
+          data
+        );
         break;
 
       case 'CALL_ACCEPT':
-        this.callbacks.onCallAccepted(data);
+        this.callbacks.onCallAccepted(
+          data
+        );
         break;
 
       case 'CALL_REJECT':
       case 'CALL_END':
-        this.callbacks.onCallEnded(data);
+        this.callbacks.onCallEnded(
+          data
+        );
         break;
 
       default:
-        this.callbacks.onMessage(data);
+        this.callbacks.onMessage(
+          data
+        );
     }
   }
 
@@ -544,7 +792,8 @@ class P2PManager {
     try {
       this.conn.send({
         ...message,
-        senderId: this.peerId
+        senderId:
+          this.peerId
       });
 
       return true;
@@ -558,7 +807,9 @@ class P2PManager {
     }
   }
 
-  async startLocalMedia(video = false) {
+  async startLocalMedia(
+    video = false
+  ) {
     if (
       !navigator.mediaDevices?.getUserMedia
     ) {
@@ -568,10 +819,12 @@ class P2PManager {
     }
 
     this.localStream =
-      await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video
-      });
+      await navigator.mediaDevices.getUserMedia(
+        {
+          audio: true,
+          video
+        }
+      );
 
     return this.localStream;
   }
@@ -599,8 +852,18 @@ class P2PManager {
       );
     }
 
+    if (
+      !this.conn?.open
+    ) {
+      throw new Error(
+        'P2P data connection is not established'
+      );
+    }
+
     const stream =
-      await this.startLocalMedia(isVideo);
+      await this.startLocalMedia(
+        isVideo
+      );
 
     const call =
       this.peer.call(
@@ -615,17 +878,22 @@ class P2PManager {
 
     this.mediaCall = call;
 
-    call.on('stream', (remoteStream) => {
-      this.remoteStream = remoteStream;
+    call.on(
+      'stream',
+      (remoteStream) => {
+        this.remoteStream =
+          remoteStream;
 
-      this.callbacks.onRemoteStream(
-        remoteStream
-      );
+        this.callbacks.onRemoteStream(
+          remoteStream
+        );
 
-      this.callbacks.onCallAccepted({
-        peerId: target
-      });
-    });
+        this.callbacks.onCallAccepted({
+          peerId:
+            target
+        });
+      }
+    );
 
     call.on('close', () => {
       this.callbacks.onCallEnded();
@@ -638,13 +906,17 @@ class P2PManager {
       );
 
       this.callbacks.onCallEnded();
-      this.callbacks.onError(error);
+      this.callbacks.onError(
+        error
+      );
     });
 
     return stream;
   }
 
-  async answerCall(isVideo = false) {
+  async answerCall(
+    isVideo = false
+  ) {
     if (!this.mediaCall) {
       throw new Error(
         'No incoming call to answer'
@@ -652,21 +924,32 @@ class P2PManager {
     }
 
     const stream =
-      await this.startLocalMedia(isVideo);
-
-    this.mediaCall.answer(stream);
-
-    this.mediaCall.on('stream', (remoteStream) => {
-      this.remoteStream = remoteStream;
-
-      this.callbacks.onRemoteStream(
-        remoteStream
+      await this.startLocalMedia(
+        isVideo
       );
-    });
 
-    this.mediaCall.on('close', () => {
-      this.callbacks.onCallEnded();
-    });
+    this.mediaCall.answer(
+      stream
+    );
+
+    this.mediaCall.on(
+      'stream',
+      (remoteStream) => {
+        this.remoteStream =
+          remoteStream;
+
+        this.callbacks.onRemoteStream(
+          remoteStream
+        );
+      }
+    );
+
+    this.mediaCall.on(
+      'close',
+      () => {
+        this.callbacks.onCallEnded();
+      }
+    );
 
     return stream;
   }
@@ -676,7 +959,7 @@ class P2PManager {
       try {
         this.mediaCall.close();
       } catch {
-        // Ignore already closed media connections.
+        // Ignore already closed calls.
       }
 
       this.mediaCall = null;
@@ -685,7 +968,9 @@ class P2PManager {
     if (this.localStream) {
       this.localStream
         .getTracks()
-        .forEach((track) => track.stop());
+        .forEach((track) =>
+          track.stop()
+        );
 
       this.localStream = null;
     }
@@ -696,22 +981,28 @@ class P2PManager {
   }
 
   toggleMicrophone(enabled) {
-    if (!this.localStream) return;
+    if (!this.localStream) {
+      return;
+    }
 
     this.localStream
       .getAudioTracks()
       .forEach((track) => {
-        track.enabled = enabled;
+        track.enabled =
+          enabled;
       });
   }
 
   toggleCamera(enabled) {
-    if (!this.localStream) return;
+    if (!this.localStream) {
+      return;
+    }
 
     this.localStream
       .getVideoTracks()
       .forEach((track) => {
-        track.enabled = enabled;
+        track.enabled =
+          enabled;
       });
   }
 
@@ -727,10 +1018,15 @@ class P2PManager {
     try {
       await fetch(
         `${SIGNAL_ORIGIN}/pair/` +
-        `${encodeURIComponent(this.pairCode)}` +
-        `?peerId=${encodeURIComponent(this.peerId)}`,
+        `${encodeURIComponent(
+          this.pairCode
+        )}` +
+        `?peerId=${encodeURIComponent(
+          this.peerId
+        )}`,
         {
-          method: 'DELETE'
+          method: 'DELETE',
+          keepalive: true
         }
       );
     } catch (error) {
@@ -742,13 +1038,30 @@ class P2PManager {
   }
 
   cleanup() {
+    this.destroying = true;
+
     this.stopPairingPolling();
 
-    if (this.peer) {
+    if (this.reconnectTimer) {
+      clearTimeout(
+        this.reconnectTimer
+      );
+
+      this.reconnectTimer = null;
+    }
+
+    /*
+     * Don't attempt to destroy a peer that is
+     * already gone.
+     */
+    if (
+      this.peer &&
+      !this.peer.destroyed
+    ) {
       try {
         this.peer.destroy();
       } catch {
-        // Ignore already-destroyed peers.
+        // Ignore cleanup errors.
       }
     }
 
@@ -757,8 +1070,16 @@ class P2PManager {
     this.partnerPeerId = null;
     this.conn = null;
     this.mediaCall = null;
-    this.connectionAttemptedFor = null;
+
+    this.localStream = null;
+    this.remoteStream = null;
+
+    this.connectionAttemptedFor =
+      null;
+
+    this.isConnected = false;
   }
 }
 
-export const p2pManager = new P2PManager();
+export const p2pManager =
+  new P2PManager();

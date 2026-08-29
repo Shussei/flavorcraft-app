@@ -3,275 +3,580 @@ const { ExpressPeerServer } = require('peer');
 
 const app = express();
 
-const PORT = Number(process.env.PORT) || 9000;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const PORT =
+  Number(process.env.PORT) || 9000;
 
-const PAIR_TTL_MS = 10 * 60 * 1000;
+const ALLOWED_ORIGIN =
+  process.env.ALLOWED_ORIGIN || '*';
+
+/*
+ * A peer must refresh its pairing registration
+ * regularly. If it disappears for this long,
+ * the server removes it.
+ */
+const PAIR_TTL_MS =
+  15 * 1000;
+
 const MAX_PEERS_PER_PAIR = 2;
 
 /*
- * In-memory pairing registry.
- *
- * pairCode -> Map(peerId, lastSeenTimestamp)
- *
- * This is intentionally small because the app is designed for
- * one private pair at a time. For multi-instance production
- * deployments, replace this with Redis or another shared store.
+ * pairCode -> Map(peerId, lastSeen)
  */
 const pairings = new Map();
 
-app.use(express.json({ limit: '32kb' }));
+app.use(
+  express.json({
+    limit: '32kb'
+  })
+);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
+/*
+ * CORS
+ */
+app.use(
+  (req, res, next) => {
+    const origin =
+      req.headers.origin;
 
-  if (ALLOWED_ORIGIN === '*' || !origin) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  } else if (origin === ALLOWED_ORIGIN) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+    if (
+      ALLOWED_ORIGIN === '*' ||
+      !origin
+    ) {
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        '*'
+      );
+    } else if (
+      origin === ALLOWED_ORIGIN
+    ) {
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        origin
+      );
+    }
+
+    res.setHeader(
+      'Vary',
+      'Origin'
+    );
+
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, DELETE, OPTIONS'
+    );
+
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type'
+    );
+
+    if (
+      req.method === 'OPTIONS'
+    ) {
+      return res.sendStatus(
+        204
+      );
+    }
+
+    next();
+  }
+);
+
+/*
+ * Validate pair code.
+ */
+function normalizePairCode(
+  value
+) {
+  if (
+    typeof value !==
+    'string'
+  ) {
+    return null;
   }
 
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type'
-  );
+  const code =
+    value.trim();
 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-
-  next();
-});
-
-function normalizePairCode(value) {
-  if (typeof value !== 'string') return null;
-
-  const code = value.trim();
-
-  if (!/^[A-Za-z0-9_-]{4,64}$/.test(code)) {
+  if (
+    !/^[A-Za-z0-9_-]{4,64}$/.test(
+      code
+    )
+  ) {
     return null;
   }
 
   return code;
 }
 
-function normalizePeerId(value) {
-  if (typeof value !== 'string') return null;
+/*
+ * Validate PeerJS ID.
+ */
+function normalizePeerId(
+  value
+) {
+  if (
+    typeof value !==
+    'string'
+  ) {
+    return null;
+  }
 
-  const peerId = value.trim();
+  const peerId =
+    value.trim();
 
-  // PeerJS IDs must start/end alphanumeric.
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,96}[A-Za-z0-9])?$/.test(peerId)) {
+  if (
+    !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,96}[A-Za-z0-9])?$/.test(
+      peerId
+    )
+  ) {
     return null;
   }
 
   return peerId;
 }
 
+/*
+ * Remove expired registrations.
+ */
 function cleanupExpiredPairings() {
-  const now = Date.now();
+  const now =
+    Date.now();
 
-  for (const [pairCode, peers] of pairings.entries()) {
-    for (const [peerId, lastSeen] of peers.entries()) {
-      if (now - lastSeen > PAIR_TTL_MS) {
-        peers.delete(peerId);
+  for (
+    const [
+      pairCode,
+      peers
+    ] of pairings.entries()
+  ) {
+    for (
+      const [
+        peerId,
+        lastSeen
+      ] of peers.entries()
+    ) {
+      if (
+        now - lastSeen >
+        PAIR_TTL_MS
+      ) {
+        console.log(
+          `[PAIR] ${pairCode}: removing stale peer ${peerId.slice(
+            0,
+            12
+          )}...`
+        );
+
+        peers.delete(
+          peerId
+        );
       }
     }
 
-    if (peers.size === 0) {
-      pairings.delete(pairCode);
+    if (
+      peers.size === 0
+    ) {
+      pairings.delete(
+        pairCode
+      );
     }
   }
 }
 
-function removePeerFromAllPairings(peerId) {
-  for (const [pairCode, peers] of pairings.entries()) {
-    peers.delete(peerId);
-
-    if (peers.size === 0) {
-      pairings.delete(pairCode);
-    }
-  }
-}
-
-setInterval(cleanupExpiredPairings, 30_000);
+setInterval(
+  cleanupExpiredPairings,
+  5000
+);
 
 /*
- * Health check
+ * Remove a PeerJS ID from every pairing room.
  */
-app.get('/', (req, res) => {
-  res.json({
-    status: 'VaultComms Signal Server Online',
-    timestamp: new Date().toISOString()
-  });
-});
+function removePeerFromAllPairings(
+  peerId
+) {
+  for (
+    const [
+      pairCode,
+      peers
+    ] of pairings.entries()
+  ) {
+    if (
+      peers.delete(peerId)
+    ) {
+      console.log(
+        `[PAIR] ${pairCode}: peer ${peerId.slice(
+          0,
+          12
+        )}... removed`
+      );
+    }
+
+    if (
+      peers.size === 0
+    ) {
+      pairings.delete(
+        pairCode
+      );
+    }
+  }
+}
 
 /*
- * Join/refresh a pairing room.
+ * Health check.
+ */
+app.get(
+  '/',
+  (req, res) => {
+    res.json({
+      status:
+        'VaultComms Signal Server Online',
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
+
+/*
+ * Join or refresh pairing room.
  *
  * POST /pair/join
- *
- * Body:
- * {
- *   "pairCode": "PAIR-1314",
- *   "peerId": "vault-..."
- * }
  */
-app.post('/pair/join', (req, res) => {
-  const pairCode = normalizePairCode(req.body?.pairCode);
-  const peerId = normalizePeerId(req.body?.peerId);
+app.post(
+  '/pair/join',
+  (req, res) => {
+    cleanupExpiredPairings();
 
-  if (!pairCode || !peerId) {
-    return res.status(400).json({
-      error: 'Invalid pairCode or peerId'
-    });
-  }
+    const pairCode =
+      normalizePairCode(
+        req.body?.pairCode
+      );
 
-  let peers = pairings.get(pairCode);
+    const peerId =
+      normalizePeerId(
+        req.body?.peerId
+      );
 
-  if (!peers) {
-    peers = new Map();
-    pairings.set(pairCode, peers);
-  }
+    if (
+      !pairCode ||
+      !peerId
+    ) {
+      return res.status(400).json({
+        error:
+          'Invalid pairCode or peerId'
+      });
+    }
 
-  /*
-   * If this peer is already registered, simply refresh it.
-   */
-  if (peers.has(peerId)) {
-    peers.set(peerId, Date.now());
+    let peers =
+      pairings.get(
+        pairCode
+      );
+
+    if (!peers) {
+      peers = new Map();
+
+      pairings.set(
+        pairCode,
+        peers
+      );
+    }
+
+    /*
+     * Existing peer:
+     * refresh its lease.
+     */
+    if (
+      peers.has(peerId)
+    ) {
+      peers.set(
+        peerId,
+        Date.now()
+      );
+
+      return res.json({
+        ok: true,
+        peers: [
+          ...peers.keys()
+        ].filter(
+          (id) =>
+            id !== peerId
+        )
+      });
+    }
+
+    /*
+     * Remove stale peers before
+     * determining whether room is full.
+     */
+    const now =
+      Date.now();
+
+    for (
+      const [
+        existingPeerId,
+        lastSeen
+      ] of peers.entries()
+    ) {
+      if (
+        now - lastSeen >
+        PAIR_TTL_MS
+      ) {
+        peers.delete(
+          existingPeerId
+        );
+      }
+    }
+
+    /*
+     * Room still full.
+     */
+    if (
+      peers.size >=
+      MAX_PEERS_PER_PAIR
+    ) {
+      return res.status(409).json({
+        error:
+          'Pairing room is full',
+        peers: [
+          ...peers.keys()
+        ]
+      });
+    }
+
+    peers.set(
+      peerId,
+      Date.now()
+    );
+
+    console.log(
+      `[PAIR] ${pairCode}: ${peerId.slice(
+        0,
+        12
+      )}... joined (${peers.size}/${MAX_PEERS_PER_PAIR})`
+    );
 
     return res.json({
       ok: true,
-      peers: [...peers.keys()].filter((id) => id !== peerId)
+      peers: [
+        ...peers.keys()
+      ].filter(
+        (id) =>
+          id !== peerId
+      )
     });
   }
-
-  /*
-   * Only two peers are allowed in one pairing room.
-   */
-  if (peers.size >= MAX_PEERS_PER_PAIR) {
-    return res.status(409).json({
-      error: 'Pairing room is full'
-    });
-  }
-
-  peers.set(peerId, Date.now());
-
-  console.log(
-    `[PAIR] ${pairCode}: ${peerId.slice(0, 12)}... joined`
-  );
-
-  return res.json({
-    ok: true,
-    peers: [...peers.keys()].filter((id) => id !== peerId)
-  });
-});
+);
 
 /*
- * Poll the current pairing room.
+ * Poll pairing room.
  *
- * GET /pair/:pairCode?peerId=...
+ * IMPORTANT:
+ * Polling only refreshes an EXISTING
+ * registration. It cannot create a third
+ * peer accidentally.
  */
-app.get('/pair/:pairCode', (req, res) => {
-  const pairCode = normalizePairCode(req.params.pairCode);
-  const peerId = normalizePeerId(req.query.peerId);
+app.get(
+  '/pair/:pairCode',
+  (req, res) => {
+    cleanupExpiredPairings();
 
-  if (!pairCode || !peerId) {
-    return res.status(400).json({
-      error: 'Invalid pairCode or peerId'
-    });
-  }
+    const pairCode =
+      normalizePairCode(
+        req.params.pairCode
+      );
 
-  const peers = pairings.get(pairCode);
+    const peerId =
+      normalizePeerId(
+        req.query.peerId
+      );
 
-  if (!peers) {
+    if (
+      !pairCode ||
+      !peerId
+    ) {
+      return res.status(400).json({
+        error:
+          'Invalid pairCode or peerId'
+      });
+    }
+
+    const peers =
+      pairings.get(
+        pairCode
+      );
+
+    if (!peers) {
+      return res.json({
+        ok: true,
+        peers: []
+      });
+    }
+
+    /*
+     * Do not add unknown peers here.
+     */
+    if (
+      !peers.has(peerId)
+    ) {
+      return res.status(404).json({
+        error:
+          'Peer is not registered in this pairing room'
+      });
+    }
+
+    /*
+     * Refresh lease.
+     */
+    peers.set(
+      peerId,
+      Date.now()
+    );
+
     return res.json({
       ok: true,
-      peers: []
+      peers: [
+        ...peers.keys()
+      ].filter(
+        (id) =>
+          id !== peerId
+      )
     });
   }
-
-  peers.set(peerId, Date.now());
-
-  return res.json({
-    ok: true,
-    peers: [...peers.keys()].filter((id) => id !== peerId)
-  });
-});
+);
 
 /*
  * Leave pairing room.
  */
-app.delete('/pair/:pairCode', (req, res) => {
-  const pairCode = normalizePairCode(req.params.pairCode);
-  const peerId = normalizePeerId(req.query.peerId);
+app.delete(
+  '/pair/:pairCode',
+  (req, res) => {
+    const pairCode =
+      normalizePairCode(
+        req.params.pairCode
+      );
 
-  if (!pairCode || !peerId) {
-    return res.status(400).json({
-      error: 'Invalid pairCode or peerId'
+    const peerId =
+      normalizePeerId(
+        req.query.peerId
+      );
+
+    if (
+      !pairCode ||
+      !peerId
+    ) {
+      return res.status(400).json({
+        error:
+          'Invalid pairCode or peerId'
+      });
+    }
+
+    const peers =
+      pairings.get(
+        pairCode
+      );
+
+    if (peers) {
+      peers.delete(
+        peerId
+      );
+
+      if (
+        peers.size === 0
+      ) {
+        pairings.delete(
+          pairCode
+        );
+      }
+    }
+
+    console.log(
+      `[PAIR] ${pairCode}: ${peerId.slice(
+        0,
+        12
+      )}... left`
+    );
+
+    return res.json({
+      ok: true
     });
   }
-
-  const peers = pairings.get(pairCode);
-
-  if (peers) {
-    peers.delete(peerId);
-
-    if (peers.size === 0) {
-      pairings.delete(pairCode);
-    }
-  }
-
-  res.json({ ok: true });
-});
+);
 
 /*
- * Start HTTP server.
+ * HTTP server.
  */
-const server = app.listen(PORT, () => {
-  console.log(
-    `[VaultComms] Signal server listening on port ${PORT}`
+const server =
+  app.listen(
+    PORT,
+    () => {
+      console.log(
+        `[VaultComms] Signal server listening on port ${PORT}`
+      );
+    }
   );
-});
 
 /*
  * PeerJS signaling server.
- *
- * Client URL:
- *
- * https://YOUR-RENDER-DOMAIN.onrender.com/peerjs
  */
-const peerServer = ExpressPeerServer(server, {
-  path: '/',
-  allow_discovery: false,
-  proxied: true,
-  concurrent_limit: 20,
-  cleanup_out_msgs: 1000
-});
-
-app.use('/peerjs', peerServer);
-
-peerServer.on('connection', (client) => {
-  const id = client.getId();
-
-  console.log(
-    `[PEER +] ${id.slice(0, 12)}... connected`
+const peerServer =
+  ExpressPeerServer(
+    server,
+    {
+      path: '/',
+      allow_discovery: false,
+      proxied: true,
+      concurrent_limit: 20,
+      cleanup_out_msgs: 1000
+    }
   );
-});
 
-peerServer.on('disconnect', (client) => {
-  const id = client.getId();
+app.use(
+  '/peerjs',
+  peerServer
+);
 
-  removePeerFromAllPairings(id);
+peerServer.on(
+  'connection',
+  (client) => {
+    const id =
+      client.getId();
 
-  console.log(
-    `[PEER -] ${id.slice(0, 12)}... disconnected`
-  );
-});
+    console.log(
+      `[PEER +] ${id.slice(
+        0,
+        12
+      )}... connected`
+    );
+  }
+);
 
-process.on('SIGTERM', () => {
-  console.log('[VaultComms] Shutting down...');
-  server.close();
-});
+peerServer.on(
+  'disconnect',
+  (client) => {
+    const id =
+      client.getId();
+
+    removePeerFromAllPairings(
+      id
+    );
+
+    console.log(
+      `[PEER -] ${id.slice(
+        0,
+        12
+      )}... disconnected`
+    );
+  }
+);
+
+/*
+ * Graceful shutdown.
+ */
+process.on(
+  'SIGTERM',
+  () => {
+    console.log(
+      '[VaultComms] Shutting down...'
+    );
+
+    server.close();
+  }
+);
