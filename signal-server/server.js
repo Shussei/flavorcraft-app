@@ -9,20 +9,25 @@ const PORT =
 const ALLOWED_ORIGIN =
   process.env.ALLOWED_ORIGIN || '*';
 
-/*
- * A peer must refresh its pairing registration
- * regularly. If it disappears for this long,
- * the server removes it.
- */
 const PAIR_TTL_MS =
   15 * 1000;
 
-const MAX_PEERS_PER_PAIR = 2;
+const MAX_PEERS_PER_PAIR =
+  2;
 
 /*
  * pairCode -> Map(peerId, lastSeen)
  */
-const pairings = new Map();
+const pairings =
+  new Map();
+
+/*
+ * ----------------------------------------------------------
+ * APPLICATION SECURITY
+ * ----------------------------------------------------------
+ */
+
+app.disable('x-powered-by');
 
 app.use(
   express.json({
@@ -31,8 +36,11 @@ app.use(
 );
 
 /*
+ * ----------------------------------------------------------
  * CORS
+ * ----------------------------------------------------------
  */
+
 app.use(
   (req, res, next) => {
     const origin =
@@ -67,15 +75,13 @@ app.use(
 
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type'
+      'Content-Type, Cache-Control'
     );
 
     if (
       req.method === 'OPTIONS'
     ) {
-      return res.sendStatus(
-        204
-      );
+      return res.sendStatus(204);
     }
 
     next();
@@ -83,14 +89,58 @@ app.use(
 );
 
 /*
- * Validate pair code.
+ * ----------------------------------------------------------
+ * NO-CACHE MIDDLEWARE
+ * ----------------------------------------------------------
+ *
+ * Pairing state is live/ephemeral.
+ *
+ * We explicitly prevent:
+ *
+ * - Browser caching
+ * - Proxy caching
+ * - Conditional 304 responses
  */
+
+function noStore(
+  req,
+  res,
+  next
+) {
+  res.setHeader(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, proxy-revalidate'
+  );
+
+  res.setHeader(
+    'Pragma',
+    'no-cache'
+  );
+
+  res.setHeader(
+    'Expires',
+    '0'
+  );
+
+  res.setHeader(
+    'Surrogate-Control',
+    'no-store'
+  );
+
+  next();
+}
+
+/*
+ * ----------------------------------------------------------
+ * VALIDATION
+ * ----------------------------------------------------------
+ */
+
 function normalizePairCode(
   value
 ) {
   if (
-    typeof value !==
-    'string'
+    typeof value !== 'string'
   ) {
     return null;
   }
@@ -109,15 +159,11 @@ function normalizePairCode(
   return code;
 }
 
-/*
- * Validate PeerJS ID.
- */
 function normalizePeerId(
   value
 ) {
   if (
-    typeof value !==
-    'string'
+    typeof value !== 'string'
   ) {
     return null;
   }
@@ -137,8 +183,11 @@ function normalizePeerId(
 }
 
 /*
- * Remove expired registrations.
+ * ----------------------------------------------------------
+ * PAIRING CLEANUP
+ * ----------------------------------------------------------
  */
+
 function cleanupExpiredPairings() {
   const now =
     Date.now();
@@ -182,17 +231,31 @@ function cleanupExpiredPairings() {
   }
 }
 
-setInterval(
-  cleanupExpiredPairings,
-  5000
-);
+/*
+ * Keep stale registrations from accumulating.
+ */
+const cleanupTimer =
+  setInterval(
+    cleanupExpiredPairings,
+    5000
+  );
 
 /*
- * Remove a PeerJS ID from every pairing room.
+ * ----------------------------------------------------------
+ * REMOVE PEER FROM ALL PAIRINGS
+ * ----------------------------------------------------------
+ *
+ * This is called when PeerJS tells us that
+ * a peer has disconnected.
  */
+
 function removePeerFromAllPairings(
   peerId
 ) {
+  if (!peerId) {
+    return;
+  }
+
   for (
     const [
       pairCode,
@@ -221,14 +284,19 @@ function removePeerFromAllPairings(
 }
 
 /*
- * Health check.
+ * ----------------------------------------------------------
+ * HEALTH CHECK
+ * ----------------------------------------------------------
  */
+
 app.get(
   '/',
+  noStore,
   (req, res) => {
     res.json({
       status:
         'VaultComms Signal Server Online',
+
       timestamp:
         new Date().toISOString()
     });
@@ -236,12 +304,23 @@ app.get(
 );
 
 /*
- * Join or refresh pairing room.
+ * ----------------------------------------------------------
+ * JOIN / REFRESH PAIRING
+ * ----------------------------------------------------------
  *
  * POST /pair/join
+ *
+ * Body:
+ *
+ * {
+ *   pairCode: "PAIR-1314",
+ *   peerId: "vault-..."
+ * }
  */
+
 app.post(
   '/pair/join',
+  noStore,
   (req, res) => {
     cleanupExpiredPairings();
 
@@ -259,10 +338,12 @@ app.post(
       !pairCode ||
       !peerId
     ) {
-      return res.status(400).json({
-        error:
-          'Invalid pairCode or peerId'
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            'Invalid pairCode or peerId'
+        });
     }
 
     let peers =
@@ -271,7 +352,8 @@ app.post(
       );
 
     if (!peers) {
-      peers = new Map();
+      peers =
+        new Map();
 
       pairings.set(
         pairCode,
@@ -293,6 +375,7 @@ app.post(
 
       return res.json({
         ok: true,
+
         peers: [
           ...peers.keys()
         ].filter(
@@ -304,7 +387,7 @@ app.post(
 
     /*
      * Remove stale peers before
-     * determining whether room is full.
+     * checking capacity.
      */
     const now =
       Date.now();
@@ -326,19 +409,23 @@ app.post(
     }
 
     /*
-     * Room still full.
+     * Pairing room is limited to
+     * exactly two devices.
      */
     if (
       peers.size >=
       MAX_PEERS_PER_PAIR
     ) {
-      return res.status(409).json({
-        error:
-          'Pairing room is full',
-        peers: [
-          ...peers.keys()
-        ]
-      });
+      return res
+        .status(409)
+        .json({
+          error:
+            'Pairing room is full',
+
+          peers: [
+            ...peers.keys()
+          ]
+        });
     }
 
     peers.set(
@@ -355,6 +442,7 @@ app.post(
 
     return res.json({
       ok: true,
+
       peers: [
         ...peers.keys()
       ].filter(
@@ -366,15 +454,19 @@ app.post(
 );
 
 /*
- * Poll pairing room.
+ * ----------------------------------------------------------
+ * POLL PAIRING
+ * ----------------------------------------------------------
  *
- * IMPORTANT:
- * Polling only refreshes an EXISTING
- * registration. It cannot create a third
- * peer accidentally.
+ * GET /pair/:pairCode?peerId=...
+ *
+ * Polling refreshes the current peer's
+ * registration and returns the other peer.
  */
+
 app.get(
   '/pair/:pairCode',
+  noStore,
   (req, res) => {
     cleanupExpiredPairings();
 
@@ -392,10 +484,12 @@ app.get(
       !pairCode ||
       !peerId
     ) {
-      return res.status(400).json({
-        error:
-          'Invalid pairCode or peerId'
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            'Invalid pairCode or peerId'
+        });
     }
 
     const peers =
@@ -403,6 +497,9 @@ app.get(
         pairCode
       );
 
+    /*
+     * Pairing room doesn't exist.
+     */
     if (!peers) {
       return res.json({
         ok: true,
@@ -411,15 +508,18 @@ app.get(
     }
 
     /*
-     * Do not add unknown peers here.
+     * The peer's registration has expired
+     * or it was removed because PeerJS disconnected.
      */
     if (
       !peers.has(peerId)
     ) {
-      return res.status(404).json({
-        error:
-          'Peer is not registered in this pairing room'
-      });
+      return res
+        .status(404)
+        .json({
+          error:
+            'Peer is not registered in this pairing room'
+        });
     }
 
     /*
@@ -432,6 +532,7 @@ app.get(
 
     return res.json({
       ok: true,
+
       peers: [
         ...peers.keys()
       ].filter(
@@ -443,10 +544,16 @@ app.get(
 );
 
 /*
- * Leave pairing room.
+ * ----------------------------------------------------------
+ * LEAVE PAIRING
+ * ----------------------------------------------------------
+ *
+ * DELETE /pair/:pairCode?peerId=...
  */
+
 app.delete(
   '/pair/:pairCode',
+  noStore,
   (req, res) => {
     const pairCode =
       normalizePairCode(
@@ -462,10 +569,12 @@ app.delete(
       !pairCode ||
       !peerId
     ) {
-      return res.status(400).json({
-        error:
-          'Invalid pairCode or peerId'
-      });
+      return res
+        .status(400)
+        .json({
+          error:
+            'Invalid pairCode or peerId'
+        });
     }
 
     const peers =
@@ -501,8 +610,11 @@ app.delete(
 );
 
 /*
- * HTTP server.
+ * ----------------------------------------------------------
+ * HTTP SERVER
+ * ----------------------------------------------------------
  */
+
 const server =
   app.listen(
     PORT,
@@ -514,17 +626,43 @@ const server =
   );
 
 /*
- * PeerJS signaling server.
+ * ----------------------------------------------------------
+ * PEERJS SIGNALING SERVER
+ * ----------------------------------------------------------
  */
+
 const peerServer =
   ExpressPeerServer(
     server,
     {
       path: '/',
-      allow_discovery: false,
-      proxied: true,
-      concurrent_limit: 20,
-      cleanup_out_msgs: 1000
+
+      /*
+       * Clients must know the peer ID.
+       * Discovery through PeerJS itself is disabled.
+       */
+      allow_discovery:
+        false,
+
+      /*
+       * Render sits behind a reverse proxy.
+       */
+      proxied:
+        true,
+
+      /*
+       * Limit concurrent PeerJS
+       * signaling connections.
+       */
+      concurrent_limit:
+        20,
+
+      /*
+       * Prevent unbounded outgoing
+       * message buffering.
+       */
+      cleanup_out_msgs:
+        1000
     }
   );
 
@@ -532,6 +670,12 @@ app.use(
   '/peerjs',
   peerServer
 );
+
+/*
+ * ----------------------------------------------------------
+ * PEERJS CONNECTION EVENTS
+ * ----------------------------------------------------------
+ */
 
 peerServer.on(
   'connection',
@@ -554,6 +698,15 @@ peerServer.on(
     const id =
       client.getId();
 
+    /*
+     * Critical:
+     *
+     * When PeerJS disconnects, immediately
+     * remove the peer from PAIR-1314.
+     *
+     * This prevents dead PeerJS IDs from being
+     * returned to other clients.
+     */
     removePeerFromAllPairings(
       id
     );
@@ -568,15 +721,53 @@ peerServer.on(
 );
 
 /*
- * Graceful shutdown.
+ * ----------------------------------------------------------
+ * GRACEFUL SHUTDOWN
+ * ----------------------------------------------------------
  */
+
+function shutdown() {
+  console.log(
+    '[VaultComms] Shutting down...'
+  );
+
+  clearInterval(
+    cleanupTimer
+  );
+
+  /*
+   * Clear in-memory pairing state.
+   */
+  pairings.clear();
+
+  server.close(
+    () => {
+      console.log(
+        '[VaultComms] HTTP server closed'
+      );
+
+      process.exit(0);
+    }
+  );
+
+  /*
+   * Don't keep Render hanging forever
+   * if an active connection refuses to close.
+   */
+  setTimeout(
+    () => {
+      process.exit(0);
+    },
+    10000
+  ).unref();
+}
+
 process.on(
   'SIGTERM',
-  () => {
-    console.log(
-      '[VaultComms] Shutting down...'
-    );
+  shutdown
+);
 
-    server.close();
-  }
+process.on(
+  'SIGINT',
+  shutdown
 );
