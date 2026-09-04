@@ -5,7 +5,7 @@ import {
 } from 'lucide-react';
 import { RECIPE_CATEGORIES, RECIPES_DATABASE } from '../data/recipesData';
 
-export default function CookbookFacade({ onSecretTrigger, secretPin = '1314' }) {
+export default function CookbookFacade({ onSecretTrigger, secretPin = '1515' }) {
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [activeRecipe, setActiveRecipe] = useState(null);
@@ -28,11 +28,11 @@ export default function CookbookFacade({ onSecretTrigger, secretPin = '1314' }) 
     return matchesCategory && matchesSearch;
   });
 
-  // Handle Search Submission (checks for Secret PIN 1314)
+  // Handle Search Submission (checks for Secret PIN 1515)
   const handleSearchSubmit = (e) => {
     if (e) e.preventDefault();
     const cleanSearch = searchQuery.trim();
-    if (cleanSearch === secretPin || cleanSearch === '1314' || cleanSearch === 'vault') {
+    if (cleanSearch === secretPin || cleanSearch === '1515' || cleanSearch === 'vault') {
       setSearchQuery('');
       onSecretTrigger();
     }
@@ -64,9 +64,9 @@ export default function CookbookFacade({ onSecretTrigger, secretPin = '1314' }) 
     return () => clearInterval(interval);
   }, [timerActive, timerSeconds]);
 
-  // Handle custom timer input submit (checks for 1314 or 13:14)
+  // Handle custom timer input submit (checks for 1515 or 15:15)
   const handleSetCustomTimer = () => {
-    if (timerInput.trim() === secretPin || timerInput.trim() === '13:14' || timerInput.trim() === '1314') {
+    if (timerInput.trim() === secretPin || timerInput.trim() === '15:15' || timerInput.trim() === '1515') {
       setShowTimerModal(false);
       setTimerInput('');
       onSecretTrigger();
@@ -380,7 +380,7 @@ export default function CookbookFacade({ onSecretTrigger, secretPin = '1314' }) 
         </div>
       )}
 
-      {/* Cooking Timer Modal (Contains Disguised PIN Trigger: 13:14 or 1314) */}
+      {/* Cooking Timer Modal (Contains Disguised PIN Trigger: 15:15 or 1515) */}
       {showTimerModal && (
         <div style={{
           position: 'fixed', inset: 0, zIndex: 50,
@@ -442,7 +442,7 @@ export default function CookbookFacade({ onSecretTrigger, secretPin = '1314' }) 
               <div style={{ display: 'flex', gap: '8px' }}>
                 <input 
                   type="text"
-                  placeholder="e.g. 15 or 13:14"
+                  placeholder="e.g. 15 or 15:15"
                   value={timerInput}
                   onChange={(e) => setTimerInput(e.target.value)}
                   style={{

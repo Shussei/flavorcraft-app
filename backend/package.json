@@ -1,0 +1,19 @@
+{
+  "name": "vaultcomms-backend",
+  "version": "2.0.0",
+  "description": "Centralized communication backend for VaultComms: WebRTC call signaling (PeerServer) and background Web Push notifications. Encrypted chat itself is handled by Supabase (Postgres via RPCs, Realtime delivery, Storage media).",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "generate-vapid": "node scripts/generate-vapid.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "express": "^4.18.2",
+    "peer": "^1.0.2",
+    "web-push": "^3.6.7"
+  }
+}

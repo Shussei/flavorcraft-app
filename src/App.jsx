@@ -6,33 +6,71 @@ import DecoyGroceryList from './components/DecoyGroceryList';
 import CommsVault from './components/CommsVault';
 import CallModal from './components/CallModal';
 
-import { p2pManager } from './services/P2PManager';
+import { callManager } from './services/CallManager';
 
-const PAIR_CODE = 'PAIR-1314';
+const DEFAULT_PAIR_CODE = 'PAIR-1314';
 
 export default function App() {
   const [appMode, setAppMode] = useState('cookbook');
+  const [pairCode, setPairCode] = useState(() => {
+    try {
+      return localStorage.getItem('vault_pair_code') || DEFAULT_PAIR_CODE;
+    } catch {
+      return DEFAULT_PAIR_CODE;
+    }
+  });
 
-  const [secretPin, setSecretPin] =
-    useState('1515');
+  const handleUpdatePairCode = (newCode) => {
+    const clean = String(newCode || '').trim().toUpperCase();
+    if (clean) {
+      setPairCode(clean);
+      try {
+        localStorage.setItem('vault_pair_code', clean);
+      } catch (err) {
+        console.warn('Failed to save pair code:', err);
+      }
+    }
+  };
 
-  const [decoyPin, setDecoyPin] =
-    useState('0000');
+  const [secretPin, setSecretPin] = useState('1515');
 
-  const [callState, setCallState] =
-    useState(null);
+  const [decoyPin, setDecoyPin] = useState('0000');
 
-  const [isVideoCall, setIsVideoCall] =
-    useState(false);
+  const [callState, setCallState] = useState(null);
 
-  const [localStream, setLocalStream] =
-    useState(null);
+  const [isVideoCall, setIsVideoCall] = useState(false);
 
-  const [remoteStream, setRemoteStream] =
-    useState(null);
+  const [localStream, setLocalStream] = useState(null);
+
+  const [remoteStream, setRemoteStream] = useState(null);
+
+  useEffect(() => {
+    callManager.setCallbacks({
+      onReady: (peerId) => {
+        console.log('[Calls] Peer ready:', peerId);
+      },
+      onIncomingCall: (data) => {
+        setIsVideoCall(Boolean(data?.isVideo));
+        setCallState('incoming');
+        setRemoteStream(null);
+      },
+      onRemoteStream: (stream) => {
+        setRemoteStream(stream);
+        setCallState('connected');
+      },
+      onCallEnded: () => {
+        setCallState(null);
+        setLocalStream(null);
+        setRemoteStream(null);
+      },
+      onError: (error) => {
+        console.error('[Calls] Call error:', error);
+      }
+    });
+  }, []);
 
   const handlePanicLock = () => {
-    p2pManager.endCall();
+    callManager.endCall();
 
     setCallState(null);
     setLocalStream(null);
@@ -48,73 +86,41 @@ export default function App() {
       }
     };
 
-    window.addEventListener(
-      'keydown',
-      handleKeyDown
-    );
+    window.addEventListener('keydown', handleKeyDown);
 
     return () => {
-      window.removeEventListener(
-        'keydown',
-        handleKeyDown
-      );
+      window.removeEventListener('keydown', handleKeyDown);
     };
   }, []);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (
-        document.hidden &&
-        appMode === 'vault'
-      ) {
+      if (document.hidden && appMode === 'vault') {
         handlePanicLock();
       }
     };
 
-    document.addEventListener(
-      'visibilitychange',
-      handleVisibilityChange
-    );
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
-      document.removeEventListener(
-        'visibilitychange',
-        handleVisibilityChange
-      );
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [appMode]);
-
-  /*
-   * IMPORTANT:
-   *
-   * P2PManager is initialized by CommsVault.
-   * App must NOT initialize it a second time.
-   */
 
   const handleStartVoiceCall = async () => {
     try {
       setIsVideoCall(false);
       setCallState('outgoing');
 
-      const stream =
-        await p2pManager.callPeer(
-          null,
-          false
-        );
+      const stream = await callManager.callPeer(false);
 
       setLocalStream(stream);
     } catch (error) {
-      console.error(
-        'Voice call failed:',
-        error
-      );
+      console.error('Voice call failed:', error);
 
       setCallState(null);
 
-      alert(
-        error?.message ||
-        'Unable to start the voice call.'
-      );
+      alert(error?.message || 'Unable to start the voice call.');
     }
   };
 
@@ -123,54 +129,35 @@ export default function App() {
       setIsVideoCall(true);
       setCallState('outgoing');
 
-      const stream =
-        await p2pManager.callPeer(
-          null,
-          true
-        );
+      const stream = await callManager.callPeer(true);
 
       setLocalStream(stream);
     } catch (error) {
-      console.error(
-        'Video call failed:',
-        error
-      );
+      console.error('Video call failed:', error);
 
       setCallState(null);
 
-      alert(
-        error?.message ||
-        'Unable to start the video call.'
-      );
+      alert(error?.message || 'Unable to start the video call.');
     }
   };
 
   const handleAcceptCall = async () => {
     try {
-      const stream =
-        await p2pManager.answerCall(
-          isVideoCall
-        );
+      const stream = await callManager.answerCall(isVideoCall);
 
       setLocalStream(stream);
       setCallState('connected');
     } catch (error) {
-      console.error(
-        'Accept call failed:',
-        error
-      );
+      console.error('Accept call failed:', error);
 
       setCallState(null);
 
-      alert(
-        error?.message ||
-        'Unable to accept the call.'
-      );
+      alert(error?.message || 'Unable to accept the call.');
     }
   };
 
   const handleEndCall = () => {
-    p2pManager.endCall();
+    callManager.endCall();
 
     setCallState(null);
     setLocalStream(null);
@@ -187,54 +174,36 @@ export default function App() {
     >
       {appMode === 'cookbook' && (
         <CookbookFacade
-          onSecretTrigger={() =>
-            setAppMode('auth_modal')
-          }
+          onSecretTrigger={() => setAppMode('auth_modal')}
           secretPin={secretPin}
         />
       )}
 
       {appMode === 'auth_modal' && (
         <AuthModal
-          onCancel={() =>
-            setAppMode('cookbook')
-          }
-          onUnlockSecret={() =>
-            setAppMode('vault')
-          }
-          onUnlockDecoy={() =>
-            setAppMode('decoy')
-          }
+          onCancel={() => setAppMode('cookbook')}
+          onUnlockSecret={() => setAppMode('vault')}
+          onUnlockDecoy={() => setAppMode('decoy')}
           secretPin={secretPin}
           decoyPin={decoyPin}
         />
       )}
 
       {appMode === 'decoy' && (
-        <DecoyGroceryList
-          onLock={handlePanicLock}
-        />
+        <DecoyGroceryList onLock={handlePanicLock} />
       )}
 
       {appMode === 'vault' && (
         <CommsVault
-          pairCode={PAIR_CODE}
+          pairCode={pairCode}
+          setPairCode={handleUpdatePairCode}
           onPanicLock={handlePanicLock}
-          onStartVoiceCall={
-            handleStartVoiceCall
-          }
-          onStartVideoCall={
-            handleStartVideoCall
-          }
+          onStartVoiceCall={handleStartVoiceCall}
+          onStartVideoCall={handleStartVideoCall}
           secretPin={secretPin}
           setSecretPin={setSecretPin}
           decoyPin={decoyPin}
           setDecoyPin={setDecoyPin}
-          callState={callState}
-          setCallState={setCallState}
-          setIsVideoCall={setIsVideoCall}
-          setLocalStream={setLocalStream}
-          setRemoteStream={setRemoteStream}
         />
       )}
 
@@ -243,15 +212,9 @@ export default function App() {
           callState={callState}
           partnerName="My Love"
           isVideoCall={isVideoCall}
-          onAcceptCall={
-            handleAcceptCall
-          }
-          onEndCall={
-            handleEndCall
-          }
-          onPanicLock={
-            handlePanicLock
-          }
+          onAcceptCall={handleAcceptCall}
+          onEndCall={handleEndCall}
+          onPanicLock={handlePanicLock}
           localStream={localStream}
           remoteStream={remoteStream}
         />

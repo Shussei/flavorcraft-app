@@ -1,103 +1,163 @@
-// Client-Side WebCrypto AES-GCM 256-Bit Encryption Engine
+const PASSPHRASE = 'vault-secret-key-1314';
+const PBKDF2_ITERATIONS = 100000;
 
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function deriveKey(password, salt) {
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    typeof password === 'string' ? new TextEncoder().encode(password) : password,
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256'
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/*
+ * Modern payloads scope the key to the pair code (both devices know it),
+ * so different rooms cannot decrypt each other. Legacy payloads from the
+ * old project used a per-message salt and remain decryptable for
+ * compatibility.
+ */
 class CryptoEngine {
   constructor() {
     this.encoder = new TextEncoder();
     this.decoder = new TextDecoder();
+    this.sessionKey = null;
+    this.pairCode = null;
   }
 
-  // Derive AES-GCM Key from passphrase using PBKDF2
-  async deriveKey(passphrase, salt) {
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw',
-      this.encoder.encode(passphrase),
-      'PBKDF2',
-      false,
-      ['deriveKey']
-    );
-
-    return crypto.subtle.deriveKey(
-      {
-        name: 'PBKDF2',
-        salt: salt,
-        iterations: 100000,
-        hash: 'SHA-256'
-      },
-      keyMaterial,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
+  async setPairCode(pairCode) {
+    this.pairCode = String(pairCode || '').trim();
+    this.sessionKey = null;
   }
 
-  // Encrypt text string into encrypted JSON payload
-  async encrypt(text, passphrase = 'vault-secret-key-1314') {
+  async getSessionKey() {
+    if (this.sessionKey) {
+      return this.sessionKey;
+    }
+
+    const secret = `comms:${this.pairCode || 'default'}`;
+    const salt = this.encoder.encode(secret);
+    this.sessionKey = await deriveKey(`${PASSPHRASE}:${this.pairCode || 'default'}`, salt);
+    return this.sessionKey;
+  }
+
+  async deriveLegacyKey(salt) {
+    return deriveKey(PASSPHRASE, salt);
+  }
+
+  async encryptText(text) {
     try {
-      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await this.getSessionKey();
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const key = await this.deriveKey(passphrase, salt);
-
-      const encryptedBuffer = await crypto.subtle.encrypt(
-        { name: 'AES-GCM', iv: iv },
+      const data = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
         key,
         this.encoder.encode(text)
       );
 
-      const payload = {
-        s: this.bufferToBase64(salt),
-        i: this.bufferToBase64(iv),
-        d: this.bufferToBase64(new Uint8Array(encryptedBuffer))
-      };
-
-      return JSON.stringify(payload);
-    } catch (err) {
-      console.error('Encryption error:', err);
-      return text;
+      return JSON.stringify({
+        v: 2,
+        i: bufferToBase64(iv),
+        d: bufferToBase64(new Uint8Array(data))
+      });
+    } catch (error) {
+      console.error('[CryptoEngine] Encryption failed:', error);
+      throw new Error('Encryption failed');
     }
   }
 
-  // Decrypt encrypted payload back to string
-  async decrypt(encryptedJson, passphrase = 'vault-secret-key-1314') {
+  async decryptText(encryptedPayload) {
+    if (typeof encryptedPayload !== 'string') {
+      throw new Error('Invalid encrypted payload');
+    }
+
+    let payload;
     try {
-      if (!encryptedJson.startsWith('{')) return encryptedJson; // Plain text fallback
-      const payload = JSON.parse(encryptedJson);
-      if (!payload.s || !payload.i || !payload.d) return encryptedJson;
-
-      const salt = this.base64ToBuffer(payload.s);
-      const iv = this.base64ToBuffer(payload.i);
-      const data = this.base64ToBuffer(payload.d);
-
-      const key = await this.deriveKey(passphrase, salt);
-
-      const decryptedBuffer = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv },
-        key,
-        data
-      );
-
-      return this.decoder.decode(decryptedBuffer);
-    } catch (err) {
-      // Return original or masked text if passphrase fails
-      return encryptedJson;
+      payload = JSON.parse(encryptedPayload);
+    } catch {
+      throw new Error('Invalid encrypted payload');
     }
+
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Invalid encrypted payload');
+    }
+
+    if (payload.v === 2 && payload.i && payload.d) {
+      try {
+        const key = await this.getSessionKey();
+        const data = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: base64ToBuffer(payload.i) },
+          key,
+          base64ToBuffer(payload.d)
+        );
+        return this.decoder.decode(data);
+      } catch {
+        throw new Error('Unable to decrypt message');
+      }
+    }
+
+    if (payload.s && payload.i && payload.d) {
+      try {
+        const key = await this.deriveLegacyKey(base64ToBuffer(payload.s));
+        const data = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: base64ToBuffer(payload.i) },
+          key,
+          base64ToBuffer(payload.d)
+        );
+        return this.decoder.decode(data);
+      } catch {
+        throw new Error('Unable to decrypt message');
+      }
+    }
+
+    throw new Error('Invalid encrypted payload');
   }
 
-  bufferToBase64(buffer) {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
+  async encryptBytes(bytes) {
+    const key = await this.getSessionKey();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+    return { data, iv: bufferToBase64(iv) };
   }
 
-  base64ToBuffer(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
+  async decryptBytes(encrypted, ivBase64) {
+    const key = await this.getSessionKey();
+    return crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: base64ToBuffer(ivBase64) },
+      key,
+      encrypted
+    );
   }
 }
 

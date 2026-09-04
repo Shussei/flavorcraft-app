@@ -4,6 +4,7 @@ import {
   ShieldCheck, Lock, Wifi
 } from 'lucide-react';
 import { ringtoneSynth } from '../services/RingtoneSynth';
+import { callManager } from '../services/CallManager';
 
 export default function CallModal({ 
   callState, // 'incoming' | 'outgoing' | 'connected'
@@ -20,8 +21,13 @@ export default function CallModal({
   const [isVideoOn, setIsVideoOn] = useState(isVideoCall);
   const [isSpeakerOn, setIsSpeakerOn] = useState(true);
 
+  useEffect(() => {
+    setIsVideoOn(isVideoCall);
+  }, [isVideoCall]);
+
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
+  const remoteAudioRef = useRef(null);
 
   // Play ringtone sounds based on state
   useEffect(() => {
@@ -51,18 +57,27 @@ export default function CallModal({
     return () => clearInterval(timer);
   }, [callState]);
 
-  // Bind WebRTC Video Streams to HTML5 Video elements
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream, isVideoOn]);
+  const showRemoteVideo =
+    isVideoOn && callState === 'connected';
 
   useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = localStream || null;
     }
-  }, [remoteStream, callState]);
+  }, [localStream, showRemoteVideo]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject =
+        showRemoteVideo ? (remoteStream || null) : null;
+    }
+
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.srcObject =
+        showRemoteVideo ? null : (remoteStream || null);
+      remoteAudioRef.current.muted = !isSpeakerOn;
+    }
+  }, [remoteStream, callState, showRemoteVideo, isSpeakerOn]);
 
   const formatDuration = (secs) => {
     const mins = Math.floor(secs / 60);
@@ -112,7 +127,13 @@ export default function CallModal({
       }}>
 
         {/* Video Call Streams */}
-        {isVideoOn && callState === 'connected' ? (
+        <audio
+          ref={remoteAudioRef}
+          autoPlay
+          playsInline
+        />
+
+        {showRemoteVideo ? (
           <div style={{
             position: 'relative', width: '100%', maxWidth: '500px', height: '360px',
             borderRadius: '24px', overflow: 'hidden', border: '1px solid rgba(255, 255, 255, 0.1)'
@@ -189,7 +210,11 @@ export default function CallModal({
             border: '1px solid rgba(255, 255, 255, 0.1)'
           }}>
             <button 
-              onClick={() => setIsMuted(!isMuted)}
+              onClick={() => {
+                const nextMuted = !isMuted;
+                setIsMuted(nextMuted);
+                callManager.toggleMicrophone(!nextMuted);
+              }}
               className="btn-icon"
               style={{ backgroundColor: isMuted ? '#f43f5e' : 'rgba(255, 255, 255, 0.1)' }}
             >
@@ -205,7 +230,11 @@ export default function CallModal({
             </button>
 
             <button 
-              onClick={() => setIsVideoOn(!isVideoOn)}
+              onClick={() => {
+                const nextVideoOn = !isVideoOn;
+                setIsVideoOn(nextVideoOn);
+                callManager.toggleCamera(nextVideoOn);
+              }}
               className="btn-icon"
               style={{ backgroundColor: isVideoOn ? '#f97316' : 'rgba(255, 255, 255, 0.1)' }}
             >

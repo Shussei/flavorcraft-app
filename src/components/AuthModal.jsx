@@ -1,16 +1,24 @@
 import React, { useState } from 'react';
 import { Lock, KeyRound, Shield, X, ArrowRight, Delete } from 'lucide-react';
 
-export default function AuthModal({ onCancel, onUnlockSecret, onUnlockDecoy, secretPin = '1314', decoyPin = '0000' }) {
+export default function AuthModal({ onCancel, onUnlockSecret, onUnlockDecoy, secretPin = '1515', decoyPin = '0000' }) {
   const [pin, setPin] = useState('');
   const [shake, setShake] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
   const handleKeyPress = (num) => {
-    if (pin.length < 6) {
-      const nextPin = pin + num;
-      setPin(nextPin);
-      setErrorMsg('');
+    if (pin.length >= 4) {
+      return;
+    }
+
+    const nextPin = pin + num;
+    setPin(nextPin);
+    setErrorMsg('');
+
+    if (nextPin.length === 4) {
+      window.setTimeout(() => {
+        submitPin(nextPin);
+      }, 80);
     }
   };
 
@@ -24,18 +32,26 @@ export default function AuthModal({ onCancel, onUnlockSecret, onUnlockDecoy, sec
     setErrorMsg('');
   };
 
+  const submitPin = (value) => {
+    if (value === secretPin) {
+      onUnlockSecret();
+      return;
+    }
+
+    if (value === decoyPin) {
+      onUnlockDecoy();
+      return;
+    }
+
+    setShake(true);
+    setErrorMsg('Incorrect authentication PIN');
+    setTimeout(() => setShake(false), 500);
+    setPin('');
+  };
+
   const handleSubmit = (e) => {
     if (e) e.preventDefault();
-    if (pin === secretPin || pin === '1314') {
-      onUnlockSecret();
-    } else if (pin === decoyPin || pin === '0000') {
-      onUnlockDecoy();
-    } else {
-      setShake(true);
-      setErrorMsg('Incorrect authentication PIN');
-      setTimeout(() => setShake(false), 500);
-      setPin('');
-    }
+    submitPin(pin);
   };
 
   return (
