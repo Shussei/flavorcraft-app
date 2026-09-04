@@ -19,6 +19,21 @@ const STATUS_LABELS = {
   failed: 'Failed to send'
 };
 
+function extractTextContent(raw) {
+  if (!raw) return '';
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string') {
+        return parsed.text;
+      }
+    } catch {
+      // Plain text string
+    }
+  }
+  return String(raw);
+}
+
 export default function MessageBubble({ msg, isMe, onRetry }) {
   const {
     id,
@@ -46,7 +61,7 @@ export default function MessageBubble({ msg, isMe, onRetry }) {
           if (!text && encryptedPayload) {
             const decrypted = await cryptoEngine.decryptText(encryptedPayload);
             if (!cancelled) {
-              setDecryptedText(decrypted);
+              setDecryptedText(extractTextContent(decrypted));
             }
           }
           return;

@@ -155,6 +155,12 @@ export default function CommsVault({
       return;
     }
 
+    // Only apply self-destruct to messages that actually have a TTL or expiration
+    const hasExpiry = Boolean(msg.expiresAt || (Number.isFinite(msg.ttl) && msg.ttl > 0));
+    if (!hasExpiry) {
+      return;
+    }
+
     let delay = null;
 
     if (msg.expiresAt) {
@@ -163,7 +169,7 @@ export default function CommsVault({
       delay = msg.ttl * 1000;
     }
 
-    if (!delay || delay <= 0) {
+    if (delay <= 0) {
       setMessages((previous) =>
         previous.filter((message) => message.id !== msg.id)
       );
